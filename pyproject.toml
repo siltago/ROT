@@ -1,0 +1,27 @@
+[project]
+name = "robot-brain"
+version = "0.1.0"
+description = "Modular social robot brain: personality, emotion, memory, decision-making, and action execution, decoupled from hardware."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "brain*", "personality*", "emotions*", "memory*", "perception*", "actions*", "hardware*", "integrations*", "api*"]

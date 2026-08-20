@@ -1,0 +1,26 @@
+name: robot_tablet_app
+description: Android-first tablet client for Robot Brain.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  web_socket_channel: ^2.4.5
+  camera: ^0.11.0
+  permission_handler: ^11.0.0
+  flutter_tts: ^4.0.0
+  sensors_plus: ^5.0.0
+  logger: ^2.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
