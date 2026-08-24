@@ -3,50 +3,116 @@ import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../../app/config.dart';
 import '../protocol/protocol.dart';
 
+enum ConnectionStatus { disconnected, connecting, connected }
+
+typedef WebSocketConnector = WebSocketChannel Function(Uri uri);
+
 class RobotConnection {
+  RobotConnection({
+    WebSocketConnector? connector,
+    this.baseReconnectDelay = AppConfig.reconnectDelay,
+    this.maxReconnectDelay = AppConfig.maxReconnectDelay,
+  }) : _connector = connector ?? WebSocketChannel.connect;
+
+  final WebSocketConnector _connector;
+  final Duration baseReconnectDelay;
+  final Duration maxReconnectDelay;
+  final StreamController<Map<String, dynamic>> _messages =
+      StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<ConnectionStatus> _statuses =
+      StreamController<ConnectionStatus>.broadcast();
   WebSocketChannel? _channel;
-  final StreamController<Map<String, dynamic>> _controller = StreamController.broadcast();
-  bool _isConnected = false;
+  StreamSubscription<dynamic>? _subscription;
+  Timer? _reconnectTimer;
+  String? _url;
+  bool _disposed = false;
+  int _attempt = 0;
+  ConnectionStatus _status = ConnectionStatus.disconnected;
 
-  Stream<Map<String, dynamic>> get onMessage => _controller.stream;
-
-  bool get isConnected => _isConnected;
+  Stream<Map<String, dynamic>> get onMessage => _messages.stream;
+  Stream<ConnectionStatus> get onStatus => _statuses.stream;
+  ConnectionStatus get status => _status;
+  bool get isConnected => _status == ConnectionStatus.connected;
 
   Future<void> connect(String url) async {
-    _channel = WebSocketChannel.connect(Uri.parse(url));
-    _isConnected = true;
-
-    _channel!.stream.listen(
-      (data) {
-        try {
-          final decoded = jsonDecode(data);
-          if (decoded is Map<String, dynamic>) {
-            _controller.add(decoded);
-          } else if (decoded is Map) {
-            _controller.add(Map<String, dynamic>.from(decoded));
-          }
-        } catch (_) {
-          // ignore invalid frames until robust parser is added
-        }
-      },
-      onError: (_) {
-        _isConnected = false;
-      },
-      onDone: () {
-        _isConnected = false;
-      },
-    );
+    _url = url;
+    _reconnectTimer?.cancel();
+    await _open();
   }
 
-  void sendMessage(RobotMessage message) {
-    if (_channel == null) return;
+  Future<void> _open() async {
+    if (_disposed || _url == null || _status == ConnectionStatus.connecting) return;
+    _setStatus(ConnectionStatus.connecting);
+    try {
+      await _subscription?.cancel();
+      await _channel?.sink.close();
+      final channel = _connector(Uri.parse(_url!));
+      _channel = channel;
+      await channel.ready.timeout(AppConfig.connectionTimeout);
+      if (_disposed) {
+        await channel.sink.close();
+        return;
+      }
+      _attempt = 0;
+      _reconnectTimer?.cancel();
+      _setStatus(ConnectionStatus.connected);
+      _subscription = channel.stream.listen(
+        _handleFrame,
+        onError: (_) => _handleDisconnect(),
+        onDone: _handleDisconnect,
+        cancelOnError: true,
+      );
+    } catch (_) {
+      await _channel?.sink.close();
+      _handleDisconnect();
+    }
+  }
+
+  void _handleFrame(dynamic data) {
+    try {
+      final decoded = jsonDecode(data.toString());
+      if (decoded is Map) _messages.add(Map<String, dynamic>.from(decoded));
+    } on FormatException {
+      // Ignore malformed frames without taking down the device connection.
+    }
+  }
+
+  void _handleDisconnect() {
+    if (_disposed) return;
+    _setStatus(ConnectionStatus.disconnected);
+    _scheduleReconnect();
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed || _url == null || _reconnectTimer?.isActive == true) return;
+    final multiplier = 1 << _attempt.clamp(0, 4).toInt();
+    final calculated = baseReconnectDelay * multiplier;
+    final delay = calculated > maxReconnectDelay ? maxReconnectDelay : calculated;
+    _attempt++;
+    _reconnectTimer = Timer(delay, _open);
+  }
+
+  bool sendMessage(RobotMessage message) {
+    if (!isConnected || _channel == null) return false;
     _channel!.sink.add(jsonEncode(message.toJson()));
+    return true;
   }
 
-  void dispose() {
-    _channel?.sink.close();
-    _controller.close();
+  void _setStatus(ConnectionStatus value) {
+    if (_status == value) return;
+    _status = value;
+    if (!_statuses.isClosed) _statuses.add(value);
+  }
+
+  Future<void> dispose() async {
+    _disposed = true;
+    _reconnectTimer?.cancel();
+    await _subscription?.cancel();
+    await _channel?.sink.close();
+    await _messages.close();
+    await _statuses.close();
   }
 }

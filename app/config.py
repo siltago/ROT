@@ -39,5 +39,8 @@ class Settings:
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+    api_host: str = os.getenv("ROBOT_API_HOST", "0.0.0.0")
+    api_port: int = int(os.getenv("ROBOT_API_PORT", "8000"))
+
 
 settings = Settings()

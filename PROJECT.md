@@ -196,6 +196,14 @@ ESP32, servos, LEDs, etc.) sem mudar a lógica de decisão central.
   fallback automático para resposta template se o LLM estiver indisponível.
 - Testes automatizados para `DecisionEngine`, `ActionExecutor` e o loop
   completo do `RobotAgent`.
+- Cliente Flutter v0.1 com câmera frontal, captura manual de frame, microfone
+  PCM16/16 kHz preparado para streaming futuro, reconhecimento de fala local,
+  TTS opcional, rosto animado, painel de debug e WebSocket configurável com
+  reconexão automática.
+- Gateway FastAPI/WebSocket em `api/server.py` integrado ao `RobotAgent` e ao
+  Ollama. O tablet usa reconhecimento de fala Android como percepção local,
+  envia a transcrição final e recebe resposta textual, estado e expressão. O
+  LLM continua sem acesso direto a hardware ou integrações.
 
 ## Funcionalidades futuras (fora de escopo nesta fase)
 

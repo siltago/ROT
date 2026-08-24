@@ -5,7 +5,7 @@ class PermissionManager {
     final cameraStatus = await Permission.camera.request();
     final microphoneStatus = await Permission.microphone.request();
 
-    final granted = cameraStatus.isGranted && microphoneStatus.isGranted;
-    return granted || cameraStatus.isLimited || microphoneStatus.isLimited;
+    return (cameraStatus.isGranted || cameraStatus.isLimited) &&
+        (microphoneStatus.isGranted || microphoneStatus.isLimited);
   }
 }

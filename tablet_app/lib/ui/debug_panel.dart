@@ -11,6 +11,10 @@ class DebugPanel extends StatelessWidget {
     required this.speechDetected,
     required this.microphoneLevel,
     required this.cameraReady,
+    required this.microphoneReady,
+    required this.brainUrl,
+    required this.onCaptureFrame,
+    required this.onOpenSettings,
   });
 
   final bool connected;
@@ -19,6 +23,10 @@ class DebugPanel extends StatelessWidget {
   final bool speechDetected;
   final double microphoneLevel;
   final bool cameraReady;
+  final bool microphoneReady;
+  final String brainUrl;
+  final VoidCallback onCaptureFrame;
+  final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -44,13 +52,31 @@ class DebugPanel extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           _row('Connection', connected ? 'ONLINE' : 'OFFLINE'),
-          _row('Brain', '192.168.1.10:8000'),
+          _row('Brain', brainUrl),
           _row('Camera', cameraReady ? 'ACTIVE' : 'OFF'),
-          _row('Microphone', 'ACTIVE'),
+          _row('Microphone', microphoneReady ? 'ACTIVE' : 'OFF'),
           _row('Speech detected', speechDetected ? 'true' : 'false'),
           _row('Robot state', robotState.label),
           _row('Expression', expression),
           _row('Volume', microphoneLevel.toStringAsFixed(2)),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: onCaptureFrame,
+                  icon: const Icon(Icons.camera_alt_outlined),
+                  label: const Text('Enviar frame'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                tooltip: 'Configurar conexão',
+                onPressed: onOpenSettings,
+                icon: const Icon(Icons.settings),
+              ),
+            ],
+          ),
         ],
       ),
     );

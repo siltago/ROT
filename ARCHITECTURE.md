@@ -112,6 +112,8 @@ lib/
 
 - rosto mínimo do robô;
 - expressões visuais em estados como idle, listening, thinking, speaking;
+- detecção facial local no tablet para deslocar suavemente o rosto virtual em
+  direção à pessoa; essa presença visual não identifica pessoas nem toma decisões;
 - debug overlay com conexão e estatísticas;
 - estado offline e erro.
 
@@ -127,6 +129,22 @@ Tablet
   -> recebe set_expression / set_state / speak
   -> atualiza face e áudio
 ```
+
+### Conversa por voz com resposta textual
+
+```text
+Android SpeechRecognizer (percepção)
+  -> recognized_speech
+  -> API WebSocket /ws/device
+  -> RobotAgent (decision -> planner -> permissions -> executor -> response)
+  -> OllamaProvider
+  -> show_message + set_expression + set_state
+  -> tablet exibe texto e anima o rosto
+```
+
+O reconhecedor Android apenas propõe a transcrição. Ele não contém
+personalidade, memória, decisão ou regras de ação. Ações sensíveis recebidas
+por esse canal usam confirmação não interativa e são negadas por padrão.
 
 ## Compatibilidade futura
 
@@ -180,3 +198,11 @@ A arquitetura foi desenhada para permitir evoluir sem quebrar o cérebro:
 - sempre ativo;
 - otimização de bateria;
 - background/foreground.
+
+## Estado da implementação v0.1
+
+O cliente Flutter captura PCM16/16 kHz diretamente do microfone, calcula RMS
+localmente, aplica VAD simples e envia envelopes versionados pelo WebSocket.
+A URL do cérebro é configuração persistente do dispositivo. `RobotConnection`
+controla a conexão e o backoff; áudio e câmera continuam sendo apenas entradas
+de percepção e nunca executam ações diretamente.

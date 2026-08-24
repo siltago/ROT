@@ -7,6 +7,7 @@ class DeviceCapabilities {
     this.screen = true,
     this.accelerometer = true,
     this.gyroscope = true,
+    this.localSpeechRecognition = true,
   });
 
   final bool cameraFront;
@@ -16,6 +17,7 @@ class DeviceCapabilities {
   final bool screen;
   final bool accelerometer;
   final bool gyroscope;
+  final bool localSpeechRecognition;
 
   List<String> toList() => [
         if (cameraFront) 'camera.front',
@@ -25,5 +27,6 @@ class DeviceCapabilities {
         if (screen) 'screen',
         if (accelerometer) 'accelerometer',
         if (gyroscope) 'gyroscope',
+        if (localSpeechRecognition) 'speech_recognition.local',
       ];
 }

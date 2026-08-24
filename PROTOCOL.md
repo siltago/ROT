@@ -31,6 +31,28 @@ Este documento define a estrutura das mensagens enviadas entre o tablet e o Robo
 
 ## Mensagens do tablet para o cérebro
 
+### recognized_speech
+
+Resultado do reconhecimento de fala executado na camada de percepção do
+tablet. Resultados parciais podem ser usados apenas para feedback visual; o
+cérebro processa somente `is_final: true`.
+
+```json
+{
+  "version": 1,
+  "type": "recognized_speech",
+  "device_id": "tablet_001",
+  "timestamp": 1712345678901,
+  "payload": {
+    "text": "Como você está hoje?",
+    "is_final": true,
+    "confidence": 0.91,
+    "language": "pt-BR",
+    "source": "android_speech_recognizer"
+  }
+}
+```
+
 ### device_hello
 
 ```json
@@ -205,6 +227,20 @@ Este documento define a estrutura das mensagens enviadas entre o tablet e o Robo
 
 ## Mensagens do cérebro para o tablet
 
+### show_transcript
+
+Confirma na interface o texto reconhecido que entrou no cérebro.
+
+```json
+{
+  "version": 1,
+  "type": "show_transcript",
+  "device_id": "tablet_001",
+  "timestamp": 1712345678901,
+  "payload": {"text": "Como você está hoje?", "final": true}
+}
+```
+
 ### ping
 
 ```json
@@ -376,3 +412,12 @@ speech_ended
 - quando uma nova funcionalidade entrar, adicionar tipo e payload sem quebrar leitura antiga;
 - mensagens de controle devem ser pequenas e estáveis;
 - dados sensíveis devem ser minimizados e eventuais blobs devem ser transmitidos somente quando necessário.
+
+## Compatibilidade da implementação v0.1
+
+- `audio_chunk` usa PCM16 mono a 16 kHz, enviado diretamente do microfone sem
+  arquivos temporários. O receptor deve aceitar variação no tamanho dos frames
+  e respeitar os metadados do payload.
+- Por compatibilidade com o protótipo inicial, o cliente também aceita
+  `type: "expression"` com `value` na raiz ou no payload. Emissores novos devem
+  usar `set_expression` e `payload.expression`.

@@ -38,6 +38,21 @@ Copie `.env.example` para `.env` se quiser customizar configurações.
 python -m app.main
 ```
 
+## Rodar o cérebro para o tablet
+
+Com o Ollama aberto e o modelo configurado disponível:
+
+```bash
+# Windows
+.venv\Scripts\python.exe -m api.server
+# Unix
+.venv/bin/python -m api.server
+```
+
+O tablet se conecta a `ws://IP_DO_COMPUTADOR:8000/ws/device`. Nesta fase, o
+Android reconhece a fala, o Robot Brain/Ollama produz a resposta e o tablet a
+exibe em texto junto com a expressão correspondente.
+
 ## Rodar os testes
 
 ```bash
