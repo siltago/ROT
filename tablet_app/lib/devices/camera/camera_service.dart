@@ -39,7 +39,8 @@ class CameraService {
   Widget get previewWidget {
     if (_controller == null || !_controller!.value.isInitialized) {
       return const Center(
-        child: Icon(Icons.videocam_off_outlined, size: 48, color: Colors.white70),
+        child:
+            Icon(Icons.videocam_off_outlined, size: 48, color: Colors.white70),
       );
     }
     return CameraPreview(_controller!);
@@ -48,7 +49,9 @@ class CameraService {
   Future<void> initialize({required bool frontCamera}) async {
     final cameras = await availableCameras();
     final selected = cameras.firstWhere(
-      (camera) => frontCamera ? camera.lensDirection == CameraLensDirection.front : camera.lensDirection == CameraLensDirection.back,
+      (camera) => frontCamera
+          ? camera.lensDirection == CameraLensDirection.front
+          : camera.lensDirection == CameraLensDirection.back,
       orElse: () => cameras.first,
     );
     _frontCamera = selected;
@@ -89,7 +92,9 @@ class CameraService {
       final rotation = InputImageRotationValue.fromRawValue(
         _frontCamera?.sensorOrientation ?? 0,
       );
-      if (format == null || rotation == null || image.planes.length != 1) return;
+      if (format == null || rotation == null || image.planes.length != 1) {
+        return;
+      }
       final plane = image.planes.first;
       final input = InputImage.fromBytes(
         bytes: plane.bytes,
@@ -112,9 +117,10 @@ class CameraService {
       }
       _missedDetections = 0;
       final face = faces.reduce(
-        (current, candidate) => candidate.boundingBox.width > current.boundingBox.width
-            ? candidate
-            : current,
+        (current, candidate) =>
+            candidate.boundingBox.width > current.boundingBox.width
+                ? candidate
+                : current,
       );
       final center = face.boundingBox.center;
       final x = (1 - center.dx / image.width).clamp(0.0, 1.0).toDouble();

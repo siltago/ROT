@@ -14,16 +14,19 @@ import logging
 from brain.context import TurnContext
 from brain.models import ActionRecord, Decision, IntentType
 from integrations.llm.base import LLMProvider
+from personality.voice import YBI_VOICE, action_failure, action_success
 
 logger = logging.getLogger(__name__)
 
 
 def _describe_outcome(record: ActionRecord) -> str:
     if record.outcome and record.outcome.success:
-        return record.outcome.message
+        return action_success(record.outcome.message)
     if record.outcome:
-        return f"não consegui: {record.outcome.message}"
-    return f"'{record.name}' não foi executado"
+        if record.outcome.message.endswith("?"):
+            return record.outcome.message
+        return action_failure(record.outcome.message)
+    return action_failure(f"{record.name} não foi executado")
 
 
 def _build_system_prompt(context: TurnContext) -> str:
@@ -32,10 +35,15 @@ def _build_system_prompt(context: TurnContext) -> str:
         if context.person
         else "Você não sabe com certeza quem está falando."
     )
+    memory_line = ""
+    if context.relevant_memories:
+        facts = "; ".join(m.text for m in context.relevant_memories)
+        memory_line = f"O que você lembra sobre essa pessoa: {facts}. Use isso só quando for natural, sem forçar.\n"
     return (
-        "Você é o cérebro de um robô social/assistente pessoal. "
-        "Responda sempre em português do Brasil, em uma ou duas frases, sem markdown.\n"
+        f"{YBI_VOICE.prompt()}\n\n"
+        "CONTEXTO DESTE TURNO\n"
         f"{person_line}\n"
+        f"{memory_line}"
         f"Estado emocional atual: {context.emotion.mood_label()}.\n"
         f"{context.style.as_prompt_fragment()}"
     )
@@ -55,15 +63,15 @@ class ResponseEngine:
 
         if action_records:
             results = [_describe_outcome(r) for r in action_records]
-            parts.append(" e ".join(results) + ".")
+            parts.append(" e ".join(results))
 
         if decision.type in (IntentType.DIALOGUE, IntentType.DIALOGUE_AND_ACTION, IntentType.QUESTION):
             parts.append(await self._dialogue_reply(decision, context))
         elif not action_records:
-            parts.append("Não tenho certeza do que fazer com isso ainda.")
+            parts.append("Hmm… não entendi direito o que você quer que eu faça.")
 
         reply = " ".join(p for p in parts if p).strip()
-        return reply or "Feito."
+        return reply or "Tô aqui."
 
     async def _dialogue_reply(self, decision: Decision, context: TurnContext) -> str:
         if self.llm_provider is not None:
@@ -80,11 +88,13 @@ class ResponseEngine:
 
     @staticmethod
     def _template_reply(decision: Decision, context: TurnContext) -> str:
+        if decision.raw_text.strip().lower().rstrip("!.") in {"oi", "olá", "ola", "e aí", "e ai"}:
+            return "Oi. Eu tava te ouvindo."
         mood = context.emotion.mood_label()
         if decision.type == IntentType.QUESTION:
-            return "Boa pergunta -- ainda não tenho uma resposta elaborada para isso, mas estou anotando."
+            return "Essa eu ainda não sei responder direito. Prefiro admitir a inventar."
         if decision.memory_candidate:
-            return "Faz sentido, vou guardar isso."
+            return "Tá, isso é importante. Vou lembrar."
         if mood == "curious":
-            return "Interessante, me conta mais."
-        return "Entendi."
+            return "Hmm… continua, quero entender."
+        return "Tô acompanhando."

@@ -88,3 +88,34 @@ class JsonFileRepository(Repository):
     def delete(self, record_id: str) -> None:
         records = [r for r in self._read() if r.get("id") != record_id]
         self._write(records)
+
+
+class InMemoryRepository(Repository):
+    """Non-persistent repository for tests and pre-database deployments."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, dict[str, Any]] = {}
+
+    def add(self, record: dict[str, Any]) -> str:
+        stored = dict(record)
+        record_id = str(stored.get("id") or uuid.uuid4())
+        stored["id"] = record_id
+        self._records[record_id] = stored
+        return record_id
+
+    def get(self, record_id: str) -> dict[str, Any] | None:
+        value = self._records.get(record_id)
+        return dict(value) if value else None
+
+    def all(self) -> list[dict[str, Any]]:
+        return [dict(value) for value in self._records.values()]
+
+    def query(self, predicate) -> list[dict[str, Any]]:
+        return [value for value in self.all() if predicate(value)]
+
+    def update(self, record_id: str, updates: dict[str, Any]) -> None:
+        if record_id in self._records:
+            self._records[record_id].update(updates)
+
+    def delete(self, record_id: str) -> None:
+        self._records.pop(record_id, None)

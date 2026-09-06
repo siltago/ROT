@@ -8,17 +8,17 @@ from brain.models import ActionOutcome, RiskLevel
 
 
 async def light_turn_on(room: str) -> ActionOutcome:
-    return ActionOutcome(success=True, message=f"Light in {room} turned on", data={"room": room})
+    return ActionOutcome(success=True, message=f"Pronto, liguei a luz de {room}", data={"room": room})
 
 
 async def light_turn_off(room: str) -> ActionOutcome:
-    return ActionOutcome(success=True, message=f"Light in {room} turned off", data={"room": room})
+    return ActionOutcome(success=True, message=f"Pronto, apaguei a luz de {room}", data={"room": room})
 
 
 async def climate_set_temperature(temperature: float) -> ActionOutcome:
     return ActionOutcome(
         success=True,
-        message=f"Temperature set to {temperature} degrees",
+        message=f"Deixei a temperatura em {temperature:g} graus",
         data={"temperature": temperature},
     )
 

@@ -7,6 +7,8 @@ ESP32Hardware later and nothing above hardware/ needs to change.
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Awaitable, Callable
 
 from actions.alexa import placeholder as alexa_actions
 from actions.executor import ActionExecutor
@@ -16,7 +18,11 @@ from actions.registry import ActionRegistry
 from actions.robot import movement as robot_actions
 from actions.smart_home import lights as light_actions
 from actions.smart_home import security as security_actions
+from actions.smart_home import devices as smart_home_actions
+from actions.utilities import local as utility_actions
+from actions.utilities import weather as weather_actions
 from app.config import settings
+from brain.action_router import LlmActionRouter
 from brain.agent import RobotAgent
 from brain.context import ContextBuilder
 from brain.decision_engine import DecisionEngine
@@ -26,12 +32,26 @@ from emotions.engine import EmotionalEngine
 from emotions.state import EmotionalStateStore
 from hardware.simulator import SimulatorHardware
 from integrations.llm.base import LLMProvider
-from integrations.llm.ollama_provider import OllamaProvider
+from integrations.llm.openai_provider import OpenAIProvider
+from integrations.weather.open_meteo import OpenMeteoWeatherProvider
+from integrations.music.service import MusicExperienceService
+from integrations.music.spotify import SpotifyProvider
+from integrations.smart_home.provider import SmartHomeProvider
+from integrations.smart_home.service import SmartHomeService
+from integrations.smart_home.home_assistant_provider import HomeAssistantProvider
 from memory.long_term import LongTermMemory
 from memory.people import PeopleDirectory
-from memory.repository import JsonFileRepository
+from memory.repository import InMemoryRepository, JsonFileRepository, Repository
 from memory.short_term import ShortTermMemory
 from personality.personality import Personality
+from skills.interpreter import SkillInterpreter
+from skills.registrar import SkillRegistrar
+from skills.store import SkillLibrary
+from brain.skill_learning import SkillTeacher
+
+logger = logging.getLogger(__name__)
+
+Speak = Callable[[str], Awaitable[None]]
 
 
 async def confirm_in_terminal(spec, arguments) -> bool:
@@ -40,23 +60,69 @@ async def confirm_in_terminal(spec, arguments) -> bool:
     return answer in ("y", "yes", "s", "sim")
 
 
+async def _cli_speak(text: str) -> None:
+    print(f"\nRobot > {text}\n")
+
+
+def build_skills_repository() -> Repository:
+    """Supabase-backed when configured (see sql/001_learned_skills.sql and
+    .env.example); falls back to a non-persistent in-memory store so the
+    rest of the app still runs before that's set up -- learned skills just
+    won't survive a restart until it is."""
+    if settings.supabase_url and settings.supabase_key:
+        from supabase import create_client
+
+        from memory.supabase_repository import SupabaseRepository
+
+        client = create_client(settings.supabase_url, settings.supabase_key)
+        return SupabaseRepository(client, table_name="learned_skills")
+    logger.warning("SUPABASE_URL/SUPABASE_KEY not set -- learned skills won't persist across restarts")
+    return InMemoryRepository()
+
+
 def build_llm_provider() -> LLMProvider | None:
     if not settings.llm_enabled:
         return None
-    if settings.llm_provider == "ollama":
-        return OllamaProvider(model=settings.ollama_model, base_url=settings.ollama_base_url)
+    if settings.llm_provider == "openai":
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            timeout=settings.openai_timeout,
+        )
     raise ValueError(f"Unknown LLM_PROVIDER '{settings.llm_provider}'")
 
 
-def build_agent(*, hardware=None, interactive_confirmation: bool = True) -> RobotAgent:
+def build_agent(
+    *, hardware=None, interactive_confirmation: bool = True,
+    smart_home_provider: SmartHomeProvider | None = None,
+    speak_resolver: Callable[[], Speak] | None = None,
+) -> RobotAgent:
     hardware = hardware or SimulatorHardware(verbose=settings.verbose_hardware)
 
     registry = ActionRegistry()
-    light_actions.register(registry)
     security_actions.register(registry)
-    music_actions.register(registry)
+    music_service = MusicExperienceService(SpotifyProvider(
+        settings.spotify_client_id, settings.spotify_client_secret,
+        settings.spotify_refresh_token, timeout=settings.spotify_timeout,
+    ))
+    music_actions.register(registry, music_service)
     alexa_actions.register(registry)
     robot_actions.register(registry, hardware)
+    weather_provider = OpenMeteoWeatherProvider(
+        float(settings.robot_latitude) if settings.robot_latitude else None,
+        float(settings.robot_longitude) if settings.robot_longitude else None,
+        settings.robot_location_name,
+        timeout=settings.weather_timeout,
+        repository=JsonFileRepository(settings.location_file),
+    )
+    utility_actions.register(registry, settings.robot_timezone, weather_provider)
+    weather_actions.register(registry, weather_provider, settings.robot_location_name)
+    smart_home_service = SmartHomeService(smart_home_provider or HomeAssistantProvider(
+        settings.home_assistant_url,
+        settings.home_assistant_token,
+        timeout_seconds=settings.home_assistant_timeout,
+    ))
+    smart_home_actions.register(registry, smart_home_service)
 
     permissions = PermissionPolicy(
         confirmation_provider=confirm_in_terminal if interactive_confirmation else auto_deny
@@ -73,9 +139,22 @@ def build_agent(*, hardware=None, interactive_confirmation: bool = True) -> Robo
     personality = Personality.load(settings.personality_file)
     emotional_engine = EmotionalEngine(EmotionalStateStore.load(settings.emotional_state_file))
 
-    response_engine = ResponseEngine(llm_provider=build_llm_provider())
+    llm_provider = build_llm_provider()
+    response_engine = ResponseEngine(llm_provider=llm_provider)
+    action_router = LlmActionRouter(llm_provider, registry)
 
-    return RobotAgent(
+    resolved_speak = speak_resolver or (lambda: _cli_speak)
+    skill_library = SkillLibrary(build_skills_repository())
+    skill_interpreter = SkillInterpreter(registry=registry, executor=executor)
+    skill_registrar = SkillRegistrar(registry, skill_interpreter, skill_library)
+    # Every previously learned skill becomes a real ActionSpec again, right
+    # here, before the agent ever processes a turn -- from that point on
+    # it's indistinguishable from a hand-coded action (same registry, same
+    # ActionExecutor path), and the LLM is never asked to re-teach it.
+    skill_registrar.load_all(speak_resolver=resolved_speak)
+    skill_teacher = SkillTeacher(llm_provider=llm_provider, registrar=skill_registrar, speak_resolver=resolved_speak)
+
+    agent = RobotAgent(
         decision_engine=decision_engine,
         planner=planner,
         executor=executor,
@@ -86,7 +165,13 @@ def build_agent(*, hardware=None, interactive_confirmation: bool = True) -> Robo
         people=people,
         long_term=long_term,
         short_term=short_term,
+        action_router=action_router,
+        skill_teacher=skill_teacher,
     )
+    agent.smart_home_service = smart_home_service
+    agent.music_service = music_service
+    agent.skill_library = skill_library
+    return agent
 
 
 async def run_cli() -> None:

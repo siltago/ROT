@@ -1,0 +1,6 @@
+# Replace with your real DuckDNS (or other) domain before deploying.
+# Caddy handles TLS certificate issuance/renewal and WebSocket upgrades
+# (wss://) automatically -- nothing else to configure.
+seunome.duckdns.org {
+    reverse_proxy brain:8000
+}

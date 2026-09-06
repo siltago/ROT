@@ -25,6 +25,7 @@ class DeviceCapabilities {
         if (microphone) 'microphone',
         if (speaker) 'speaker',
         if (screen) 'screen',
+        if (screen) 'screen.scenes.v1',
         if (accelerometer) 'accelerometer',
         if (gyroscope) 'gyroscope',
         if (localSpeechRecognition) 'speech_recognition.local',

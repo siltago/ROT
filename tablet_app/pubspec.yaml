@@ -20,6 +20,11 @@ dependencies:
   speech_to_text: ^7.3.0
   sensors_plus: ^5.0.0
   logger: ^2.0.0
+  audioplayers: ^6.1.0
+  # Extracts real dominant colors from a track's own album art, so the
+  # music scene's backdrop is always accurate to that specific song instead
+  # of a generic/unrelated decoration.
+  palette_generator: ^0.3.3
 
 dev_dependencies:
   flutter_test:
@@ -28,3 +33,19 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # Lyric Mode's per-mood typography (see _MoodStyle in
+  # presentation_scene_widget.dart) -- deliberately distinct from the
+  # Android system font, all OFL-licensed (see assets/fonts/OFL.txt).
+  fonts:
+    - family: BebasNeue
+      fonts:
+        - asset: assets/fonts/BebasNeue-Regular.ttf
+    - family: PlayfairDisplayItalic
+      fonts:
+        - asset: assets/fonts/PlayfairDisplay-Italic.ttf
+    - family: Quicksand
+      fonts:
+        - asset: assets/fonts/Quicksand.ttf
+    - family: Poppins
+      fonts:
+        - asset: assets/fonts/Poppins-Medium.ttf

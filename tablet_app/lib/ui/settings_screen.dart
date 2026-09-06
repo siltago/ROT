@@ -22,7 +22,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _save() {
     final value = _controller.text.trim();
     final uri = Uri.tryParse(value);
-    if (uri == null || !uri.hasAuthority || (uri.scheme != 'ws' && uri.scheme != 'wss')) {
+    if (uri == null ||
+        !uri.hasAuthority ||
+        (uri.scheme != 'ws' && uri.scheme != 'wss')) {
       setState(() => _error = 'Use ws:// ou wss:// com endereço e porta.');
       return;
     }
@@ -51,7 +53,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onSubmitted: (_) => _save(),
             ),
             const SizedBox(height: 16),
-            FilledButton(onPressed: _save, child: const Text('Salvar e reconectar')),
+            FilledButton(
+                onPressed: _save, child: const Text('Salvar e reconectar')),
           ],
         ),
       ),

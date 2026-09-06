@@ -8,11 +8,14 @@ actions), executes with a timeout, and returns a fully logged ActionRecord.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 
 from actions.permissions import PermissionPolicy
 from actions.registry import ActionRegistry
 from brain.models import ActionOutcome, ActionRecord, ActionRequest
+
+logger = logging.getLogger(__name__)
 
 
 class ActionValidationError(Exception):
@@ -73,9 +76,17 @@ class ActionExecutor:
                 spec.handler(**request.arguments), timeout=spec.timeout_seconds
             )
         except asyncio.TimeoutError:
-            outcome = ActionOutcome(success=False, message=f"Action '{request.name}' timed out")
-        except Exception as exc:  # noqa: BLE001 -- action handlers are untrusted-ish plugins
-            outcome = ActionOutcome(success=False, message=f"Action '{request.name}' failed: {exc}")
+            logger.warning("Action '%s' timed out", request.name)
+            outcome = ActionOutcome(success=False, message="Isso demorou demais e eu desisti.")
+        except Exception:  # noqa: BLE001 -- action handlers are untrusted-ish plugins
+            # A handler's exception (an HTTP error body, a stack trace...)
+            # is exactly the kind of thing that must never reach the user
+            # verbatim -- it gets spoken aloud by the response engine, and a
+            # raw "403 Restriction Violated" or similar is both meaningless
+            # to them and possibly leaks internal detail. Logged in full
+            # here for debugging; only a generic message goes further.
+            logger.exception("Action '%s' failed", request.name)
+            outcome = ActionOutcome(success=False, message="Não consegui fazer isso agora.")
 
         record = ActionRecord(
             id=record_id,

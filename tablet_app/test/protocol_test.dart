@@ -33,6 +33,7 @@ void main() {
     expect(message.type, 'audio_chunk');
     expect(message.payload?['encoding'], 'pcm16');
     expect(message.payload?['sample_rate'], 16000);
-    expect(base64Decode(message.payload?['data_base64'] as String), [1, 2, 3, 4]);
+    expect(
+        base64Decode(message.payload?['data_base64'] as String), [1, 2, 3, 4]);
   });
 }

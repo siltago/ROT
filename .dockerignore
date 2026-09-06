@@ -1,0 +1,17 @@
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+tablet_app/
+tests/
+*.log
+.env
+.env.example
+
+# Local runtime state -- must not ship baked into the image; the compose
+# setup mounts the real ./data/{state,memories,people} directories from
+# the host instead, so a fresh deploy never wipes the robot's memory.
+data/state/*.json
+data/memories/*.json
+data/people/*.json

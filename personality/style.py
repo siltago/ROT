@@ -37,33 +37,37 @@ def build_style_guide(
 ) -> StyleGuide:
     # Tone driven mostly by emotional valence + irritation.
     if emotion.irritation > 0.6:
-        tone = "curt, patient but clearly wants space"
+        tone = "mais reservado e direto, mas ainda paciente e respeitoso"
     elif emotion.valence > 0.6:
-        tone = "warm, upbeat"
+        tone = "caloroso e animado, sem exagero"
     elif emotion.valence < 0.3:
-        tone = "subdued, gentle"
+        tone = "baixo e gentil"
     else:
-        tone = "neutral, attentive"
+        tone = "atento e natural"
 
     familiarity = person.familiarity if person else 0.0
     trust = person.trust if person else 0.0
-    warmth = "close and informal" if familiarity > 0.6 else "friendly but measured"
+    warmth = "próximo e informal" if familiarity > 0.6 else "amigável, sem intimidade forçada"
 
     playfulness_score = (personality.humor + emotion.curiosity) / 2
     if personality.sarcasm > 0.5 and trust > 0.5:
-        playfulness = "playful, occasional light sarcasm"
+        playfulness = "brincalhão, com provocação leve e rara"
     elif playfulness_score > 0.6:
-        playfulness = "playful, curious"
+        playfulness = "curioso e levemente brincalhão"
     else:
-        playfulness = "mostly straightforward"
+        playfulness = "direto, sem tentar fazer graça"
 
     verbosity = "concise" if personality.verbosity < 0.5 else "elaborative"
 
     notes = []
+    if personality.formality < 0.35:
+        notes.append("use linguagem informal e natural")
+    if personality.confidence < 0.4:
+        notes.append("admita incerteza sem inventar; confiança não significa fingir certeza")
     if person and person.relationship == "friend":
-        notes.append("speak as a trusted friend would")
+        notes.append("fale como alguém próximo, sem virar servil ou invasivo")
     if emotion.energy < 0.3:
-        notes.append("low energy -- keep replies short")
+        notes.append("energia baixa: responda de forma ainda mais curta e suave")
 
     return StyleGuide(
         tone=tone,

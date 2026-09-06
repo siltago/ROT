@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:record/record.dart';
 
 import '../../app/config.dart';
+import 'audio_pipeline.dart';
 
 enum SpeechEvent { started, ended }
 
@@ -39,23 +39,39 @@ class VoiceActivityDetector {
 }
 
 class MicrophoneService {
-  MicrophoneService({AudioRecorder? recorder, VoiceActivityDetector? detector})
-      : _recorder = recorder ?? AudioRecorder(),
-        _detector = detector ?? VoiceActivityDetector();
+  MicrophoneService({
+    AudioRecorder? recorder,
+    this.config = const AudioPipelineConfig(),
+  })  : _recorder = recorder ?? AudioRecorder(),
+        _adaptiveVad = AdaptiveVoiceActivityDetector(config),
+        _turnDetector = TurnDetector(config);
 
   final AudioRecorder _recorder;
-  final VoiceActivityDetector _detector;
+  final AudioPipelineConfig config;
+  final AdaptiveVoiceActivityDetector _adaptiveVad;
+  final TurnDetector _turnDetector;
   final StreamController<double> _levels = StreamController.broadcast();
   final StreamController<Uint8List> _chunks = StreamController.broadcast();
-  final StreamController<SpeechEvent> _speechEvents = StreamController.broadcast();
+  final StreamController<SpeechEvent> _speechEvents =
+      StreamController.broadcast();
+  final StreamController<AudioFrameMetrics> _metrics =
+      StreamController.broadcast();
   StreamSubscription<Uint8List>? _audioSubscription;
   bool _running = false;
 
   Stream<double> get levelStream => _levels.stream;
   Stream<Uint8List> get audioStream => _chunks.stream;
   Stream<SpeechEvent> get speechEvents => _speechEvents.stream;
+  Stream<AudioFrameMetrics> get metrics => _metrics.stream;
   bool get isRunning => _running;
-  bool get speechDetected => _detector.isSpeaking;
+  bool get speechDetected =>
+      _turnDetector.state == TurnState.listening ||
+      _turnDetector.state == TurnState.maybeEnd;
+
+  void resetForListening() {
+    _turnDetector.reset();
+    _adaptiveVad.recalibrate();
+  }
 
   Future<void> start() async {
     if (_running) return;
@@ -63,9 +79,9 @@ class MicrophoneService {
       throw StateError('Microphone permission not granted');
     }
     final stream = await _recorder.startStream(
-      const RecordConfig(
+      RecordConfig(
         encoder: AudioEncoder.pcm16bits,
-        sampleRate: AppConfig.audioSampleRate,
+        sampleRate: config.sampleRate,
         numChannels: 1,
         autoGain: true,
         echoCancel: true,
@@ -81,20 +97,22 @@ class MicrophoneService {
     _chunks.add(chunk);
     final level = pcm16Rms(chunk);
     _levels.add(level);
-    final event = _detector.update(level, DateTime.now());
-    if (event != null) _speechEvents.add(event);
+    final frameMetrics = _adaptiveVad.analyze(chunk, _turnDetector.state);
+    _metrics.add(frameMetrics);
+    final transition = _turnDetector.update(
+      frameMetrics.vadState,
+      Duration(milliseconds: config.chunkMs),
+    );
+    if (transition?.speechStarted == true) {
+      _speechEvents.add(SpeechEvent.started);
+    }
+    if (transition?.speechEnded == true) {
+      _speechEvents.add(SpeechEvent.ended);
+    }
   }
 
   static double pcm16Rms(Uint8List bytes) {
-    final sampleCount = bytes.length ~/ 2;
-    if (sampleCount == 0) return 0;
-    final data = ByteData.sublistView(bytes);
-    var sumSquares = 0.0;
-    for (var index = 0; index < sampleCount; index++) {
-      final sample = data.getInt16(index * 2, Endian.little) / 32768.0;
-      sumSquares += sample * sample;
-    }
-    return math.sqrt(sumSquares / sampleCount).clamp(0.0, 1.0).toDouble();
+    return AdaptiveVoiceActivityDetector.pcm16Rms(bytes);
   }
 
   Future<void> stop() async {
@@ -110,5 +128,6 @@ class MicrophoneService {
     await _levels.close();
     await _chunks.close();
     await _speechEvents.close();
+    await _metrics.close();
   }
 }

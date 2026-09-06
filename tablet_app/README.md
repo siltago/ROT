@@ -65,7 +65,8 @@ Antes de abrir o app, inicie o gateway na raiz do repositório:
 .venv\Scripts\python.exe -m api.server
 ```
 
-O app reconhece fala em português no Android, envia a transcrição final ao
-Robot Brain e mostra a resposta textual e a expressão recebidas. O serviço de
+O app reconhece fala em português no Android e envia a transcrição final ao
+Robot Brain. A tela principal mostra a expressão recebida sem exibir a prévia
+da câmera ou a caixa de transcrição. O serviço de
 reconhecimento disponível no tablet pode depender dos componentes de voz do
 Google/Samsung e, conforme a configuração do Android, de internet.

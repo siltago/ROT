@@ -18,3 +18,5 @@ data/people/*.json
 !data/state/.gitkeep
 !data/memories/.gitkeep
 !data/people/.gitkeep
+server*.log
+server.runtime.*.log

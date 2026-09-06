@@ -130,4 +130,8 @@ async def test_handler_exception_is_captured_as_failed_outcome():
     record = await executor.execute(ActionRequest(name="broken.action", arguments={}))
 
     assert record.outcome.success is False
-    assert "boom" in record.outcome.message
+    # The raw exception (a stack trace, an HTTP error body...) must never
+    # reach the user -- it gets spoken aloud by the response engine. Only a
+    # generic message goes through; the real exception is logged instead.
+    assert "boom" not in record.outcome.message
+    assert record.outcome.message

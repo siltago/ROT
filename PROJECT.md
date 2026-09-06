@@ -42,6 +42,27 @@ O mesmo princípio se aplica a identidade (voz/câmera): o resto do sistema
 só conhece `IdentityResult(person_id, confidence, source)`, nunca como a
 identidade foi resolvida.
 
+## Restrição de implantação final
+
+O produto final deve funcionar com **apenas um ESP32 no corpo do Bob**. O
+ESP32 é responsável por sensores, atuadores e comunicação, mas não hospeda o
+cérebro, o modelo de IA nem o banco de dados. Cérebro, inferência, memória e
+persistência ficam em serviços de nuvem acessados por uma conexão segura.
+
+Consequências desta restrição:
+
+- o banco de produção deve ser remoto e gerenciado; PostgreSQL é o padrão;
+- Supabase é a opção inicial preferida por oferecer PostgreSQL gerenciado,
+  autenticação e API, sem criar dependência no código de domínio;
+- SQLite pode ser usado somente em desenvolvimento, testes ou cache local de
+  um gateway, nunca como fonte principal de memória no produto final;
+- o ESP32 nunca recebe credenciais administrativas do banco e não acessa suas
+  tabelas diretamente: comunica-se com a API/WebSocket do cérebro;
+- pesos de modelos e datasets de treinamento ficam em armazenamento de
+  objetos, enquanto o banco guarda metadados, memórias, relações e embeddings;
+- toda persistência continua atrás da interface `Repository`, permitindo
+  trocar o provedor de nuvem sem alterar a lógica cognitiva.
+
 ## Fluxo obrigatório de uma interação
 
 ```
@@ -77,8 +98,9 @@ actions/        registry, executor, política de permissões, e as ações
 hardware/       RobotHardware (abstrato), SimulatorHardware (implementado),
                 ESP32Hardware (placeholder), protocolo de comando
 integrations/   clientes de serviços externos -- integrations/llm/ (LLMProvider
-                abstrato + OllamaProvider) está implementado; o resto
-                (Alexa, Home Assistant, Spotify) é reservado para o futuro
+                abstrato + OpenAIProvider) está implementado; o resto
+                (Alexa, Spotify) é reservado para o futuro; Home Assistant local
+                está implementado como provider de casa inteligente
 api/            reservado para uma futura API HTTP/WebSocket
 data/           persistência local em JSON (people, memories, state)
 tablet_app/     app Android/Flutter para tablet como corpo provisório do robô:
@@ -157,9 +179,9 @@ ESP32, servos, LEDs, etc.) sem mudar a lógica de decisão central.
   executada antes disso pelo pipeline determinístico. Se o provider falhar
   ou não estiver configurado, cai automaticamente para uma resposta template
   local; um turno nunca fica sem resposta por causa de rede/modelo local
-  indisponível. Implementação atual: `OllamaProvider` (local, gratuito,
-  configurável via `LLM_PROVIDER`/`OLLAMA_MODEL`/`OLLAMA_BASE_URL` no
-  `.env`). Trocar para outro provider (ex.: Claude API) no futuro é uma
+  indisponível. Implementação atual: `OpenAIProvider` via Responses API,
+  configurável por `LLM_PROVIDER`/`OPENAI_API_KEY`/`OPENAI_MODEL` no
+  `.env`. Trocar para outro provider no futuro é uma
   nova classe em `integrations/llm/` + uma linha de wiring em
   `app/main.py::build_llm_provider` -- nada em `brain/` muda.
 - **Personalidade vs. emoção são sistemas separados.** `PersonalityTraits`
@@ -192,7 +214,7 @@ ESP32, servos, LEDs, etc.) sem mudar a lógica de decisão central.
 - Memória de curto prazo (conversa), longo prazo (JSON) e por pessoa.
 - CLI de texto (`app/main.py`) funcional ponta a ponta, com confirmação
   interativa no terminal para ações de alto risco.
-- Geração de resposta de diálogo/pergunta via LLM local (Ollama), com
+- Geração de resposta de diálogo/pergunta via OpenAI API, com
   fallback automático para resposta template se o LLM estiver indisponível.
 - Testes automatizados para `DecisionEngine`, `ActionExecutor` e o loop
   completo do `RobotAgent`.
@@ -200,8 +222,8 @@ ESP32, servos, LEDs, etc.) sem mudar a lógica de decisão central.
   PCM16/16 kHz preparado para streaming futuro, reconhecimento de fala local,
   TTS opcional, rosto animado, painel de debug e WebSocket configurável com
   reconexão automática.
-- Gateway FastAPI/WebSocket em `api/server.py` integrado ao `RobotAgent` e ao
-  Ollama. O tablet usa reconhecimento de fala Android como percepção local,
+- Gateway FastAPI/WebSocket em `api/server.py` integrado ao `RobotAgent` e à
+  OpenAI Responses API. O tablet usa reconhecimento de fala Android como percepção local,
   envia a transcrição final e recebe resposta textual, estado e expressão. O
   LLM continua sem acesso direto a hardware ou integrações.
 
@@ -216,3 +238,84 @@ ESP32, servos, LEDs, etc.) sem mudar a lógica de decisão central.
 - Fallback via LLM no `DecisionEngine` para entradas ambíguas.
 - API HTTP/WebSocket (`api/`) para clientes externos.
 - Substituição do `JsonFileRepository` por um banco real / vector DB.
+
+## Áudio conversacional do tablet
+
+A evolução do áudio passa a usar módulos independentes do fornecedor de IA:
+noise floor adaptativo, VAD com probabilidade, máquina de turno e pre/post-roll.
+O baseline e a estratégia incremental estão em `tablet_app/AUDIO_PIPELINE.md`.
+O PCM só substituirá o reconhecedor Android no fluxo principal quando o backend
+tiver STT de streaming compatível, preservando a conversa funcional durante a
+migração.
+
+O protocolo agora também suporta sessões PCM incrementais com frames WebSocket
+binários, sequência, fila limitada e cancelamento. A transcrição é representada
+por contratos genéricos em `perception/speech/streaming.py`; integrações de STT
+não podem vazar tipos do fornecedor para o `RobotAgent`. Transcripts parciais
+são exclusivamente observacionais e apenas um final idempotente por stream pode
+entrar no pipeline de decisão.
+
+## Comportamento e iniciativa limitada
+
+O estado efêmero da sessão vive em `brain/world_state.py`. Eventos internos são
+publicados por `brain/events.py`; `brain/behaviors.py` transforma eventos apenas
+em `BehaviorProposal`, sujeitas a prioridade, cooldown, estado ocupado e limite
+por hora. Comportamentos nunca executam handlers. Ações locais de hora, data e
+status usam o mesmo `ActionRegistry`/`ActionExecutor` das demais capacidades.
+O relatório e as fronteiras para futura persistência estão em
+`BEHAVIOR_MILESTONE.md`.
+
+## Cognition v0.2 orientada a eventos
+
+O caminho proativo agora usa `RobotEvent`/`EventType`, fontes desacopladas,
+`WorldStateReducer`, `ContextEvaluator`, drives independentes de emoção,
+behaviors contextuais, `ProposalArbiter` e iniciativa limitada. Nenhum desses
+componentes executa ações; uma ação sugerida continua obrigada a passar por
+Planner, PermissionPolicy e ActionExecutor. Estado, cooldowns e métricas desta
+fase permanecem em RAM. O desenho, configuração, simulação e validação estão em
+`COGNITION_V02.md`.
+
+## Smart Home v0.1
+
+Casa inteligente usa `SmartHomeService` e `SmartHomeProvider`; o provider
+inicial é `HomeAssistantProvider`, conectado por REST ao Home Assistant na rede
+local. Targets são resolvidos localmente contra um registry normalizado em RAM.
+URL e token vêm do ambiente do cérebro e nunca chegam ao tablet ou ESP32. Todos
+os comandos continuam passando por Planner, PermissionPolicy e ActionExecutor,
+possuem `request_id` e timeout e nunca usam LLM. O desenho e a configuração
+estão em `PROTOCOL.md`, `ARCHITECTURE.md` e `HOME_ASSISTANT_SETUP.md`.
+
+## Identidade verbal do Bob
+
+O contrato estável de voz vive em `personality/voice.py` e é aplicado tanto ao
+prompt do LLM quanto às respostas determinísticas. Bob fala em português
+brasileiro natural, geralmente em uma ou duas frases, com curiosidade, afeto
+discreto e humor ocasional; evita linguagem corporativa, servilismo, markdown e
+bordões repetitivos. Emoção e relacionamento modulam o tom, mas não substituem
+a identidade. O contrato é exclusivamente de apresentação e nunca propõe,
+confirma ou executa ações.
+
+## Linguagem visual do Bob
+
+O fundo da interface é sempre preto. Em conversa social e respostas breves, a
+face com olhos continua sendo a apresentação padrão. Quando um resultado tem
+valor visual (hora, data, clima, música, timer e casos futuros), o
+`PresentationPlanner` pode selecionar uma `SceneSpec` em tela cheia; durante a
+cena os olhos desaparecem completamente. O cliente desenha animações
+procedurais de um catálogo local e retorna à face ao expirar ou receber
+`dismiss_scene`. A decisão é semântica e determinística, baseada em resultados
+de ações validadas; nenhum texto de LLM vira código de interface.
+
+O relógio segue uma identidade de painel digital: dígitos de sete segmentos,
+segundos, data e ambiente procedural. A implementação atual usa verde luminoso
+e cenário em pixel art, com zonas reservadas para impedir que
+texto, temperatura e elementos ambientais se sobreponham. Amanhecer mostra um sol baixo,
+dia mostra o sol alto e noite mostra lua e estrelas, sempre sobre preto. O fuso
+vem de `ROBOT_TIMEZONE`, não do servidor cloud. Clima usa coordenadas explícitas
+do robô e o provider gratuito Open-Meteo; sem localização, Bob informa que ela
+precisa ser configurada e nunca inventa uma temperatura.
+
+Perguntas sobre o momento atual usam `weather.get`; perguntas com “amanhã”
+usam `weather.forecast`. A previsão fala mínima, máxima, condição e chance de
+chuva e a cena é escolhida pelo código meteorológico, nunca pela temperatura
+isolada. Céu limpo à noite usa lua/estrelas, não sol.

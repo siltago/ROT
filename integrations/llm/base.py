@@ -1,8 +1,8 @@
 """Abstract LLM provider interface.
 
 Mirrors the hardware/base.py pattern: brain/response_engine.py depends only
-on `LLMProvider`, never on a concrete client. Swapping Ollama for the Claude
-API (or any other provider) later means writing a new class here and
+on `LLMProvider`, never on a concrete client. Swapping OpenAI for another
+provider later means writing a new class here and
 changing one line of wiring in app/main.py -- nothing in brain/ changes.
 """
 from __future__ import annotations

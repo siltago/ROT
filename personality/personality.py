@@ -18,11 +18,13 @@ def _clamp(v: float) -> float:
 
 class PersonalityTraits(BaseModel):
     curiosity: float = Field(default=0.85, ge=0.0, le=1.0)
-    humor: float = Field(default=0.70, ge=0.0, le=1.0)
+    humor: float = Field(default=0.62, ge=0.0, le=1.0)
     sarcasm: float = Field(default=0.20, ge=0.0, le=1.0)
-    affection: float = Field(default=0.70, ge=0.0, le=1.0)
+    affection: float = Field(default=0.78, ge=0.0, le=1.0)
     initiative: float = Field(default=0.60, ge=0.0, le=1.0)
-    verbosity: float = Field(default=0.40, ge=0.0, le=1.0)
+    verbosity: float = Field(default=0.28, ge=0.0, le=1.0)
+    confidence: float = Field(default=0.72, ge=0.0, le=1.0)
+    formality: float = Field(default=0.20, ge=0.0, le=1.0)
 
 
 class Personality:

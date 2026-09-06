@@ -12,17 +12,25 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from actions.executor import ActionExecutor
+from brain.action_router import LlmActionRouter
 from brain.context import ContextBuilder
+from brain.behaviors import BehaviorEngine, BehaviorProposal, InitiativeEngine
 from brain.decision_engine import DecisionEngine
+from brain.cognition import CognitionEngine
+from brain.events import EventBus, EventType
 from brain.models import ActionRecord, BrainEvent, Decision, IntentType, Turn
 from brain.planner import Planner
 from brain.response_engine import ResponseEngine
+from brain.skill_learning import SkillLearningState, SkillTeacher, SkillTeachResult, SkillTeachStatus
+from brain.world_state import WorldState
 from emotions.engine import EmotionalEngine
 from emotions.events import EmotionEvent
 from memory.long_term import LongTermMemory, MemoryKind, MemoryRecord, score_candidate
 from memory.people import PeopleDirectory, PersonProfile
 from memory.short_term import ShortTermMemory
+from perception.speech.yes_no import classify_yes_no
 from personality.personality import Personality
+from personality.voice import learning_clarify
 
 EventSink = Callable[[BrainEvent], None]
 
@@ -43,6 +51,7 @@ class TurnResult:
     decision: Decision
     action_records: list[ActionRecord] = field(default_factory=list)
     person: PersonProfile | None = None
+    behavior_proposals: list[BehaviorProposal] = field(default_factory=list)
 
 
 class RobotAgent:
@@ -60,8 +69,17 @@ class RobotAgent:
         long_term: LongTermMemory,
         short_term: ShortTermMemory,
         event_sink: EventSink = print_event_sink,
+        world_state: WorldState | None = None,
+        event_bus: EventBus | None = None,
+        behavior_engine: BehaviorEngine | None = None,
+        initiative_engine: InitiativeEngine | None = None,
+        action_router: LlmActionRouter | None = None,
+        skill_teacher: SkillTeacher | None = None,
     ) -> None:
         self.decision_engine = decision_engine
+        self.action_router = action_router
+        self.skill_teacher = skill_teacher
+        self.learning_state = SkillLearningState()
         self.planner = planner
         self.executor = executor
         self.context_builder = context_builder
@@ -72,17 +90,73 @@ class RobotAgent:
         self.long_term = long_term
         self.short_term = short_term
         self.event_sink = event_sink
+        self.world_state = world_state or WorldState()
+        self.event_bus = event_bus or EventBus()
+        self.behavior_engine = behavior_engine or BehaviorEngine()
+        self.initiative_engine = initiative_engine or InitiativeEngine()
+        self.cognition = CognitionEngine(
+            world_state=self.world_state,
+            event_bus=self.event_bus,
+            emotional_state=self.emotional_engine.state,
+            personality=self.personality.traits,
+        )
 
     async def process_turn(self, text: str, person_id: str | None = None) -> TurnResult:
         start = time.monotonic()
+        self.world_state.mark_user_turn(person_id)
+        self.event_bus.publish(EventType.USER_SPOKE, {"person_id": person_id or "unknown", "text": text})
 
         self.emotional_engine.decay()
 
         person = self.people.get_or_create(person_id) if person_id else None
 
+        # A skill-teaching attempt in progress owns the next turn entirely
+        # (a clarifying answer or a yes/no approval) -- it never goes
+        # through the normal decision/planner/executor/dialogue pipeline,
+        # same principle as api/server.py's pending_music_offer intercepting
+        # a transcript before wake-word handling. Lives on the agent (not a
+        # tablet-only DeviceSession) so this works identically from the CLI.
+        if self.learning_state.active:
+            self.short_term.add(Turn(speaker="user", text=text, person_id=person_id))
+            reply = await self._continue_learning(text)
+            return self._learning_turn_result(text, reply, person, person_id)
+
+        previous_turns = self.short_term.recent(1)
+        previous_robot_text = (
+            previous_turns[0].text
+            if previous_turns and previous_turns[0].speaker == "robot"
+            else None
+        )
         self.short_term.add(Turn(speaker="user", text=text, person_id=person_id))
 
-        decision = self.decision_engine.classify(text)
+        intent_started = time.monotonic()
+        decision = self.decision_engine.classify_follow_up(text, previous_robot_text)
+        # The regex rules only recognize phrasings someone already thought to
+        # write a pattern for. Rather than growing that list forever, an
+        # utterance that regex saw as plain dialogue (no clear command) gets
+        # one shot at real understanding from the LLM before settling for
+        # "just talk back" -- this is what lets "entra no player" or "toque
+        # a música X" work without a hand-written rule for every way to say
+        # them, while every previously-recognized phrasing stays instant and
+        # free (no LLM call at all).
+        if (
+            decision.type in (IntentType.DIALOGUE, IntentType.AMBIGUOUS, IntentType.QUESTION)
+            and decision.memory_candidate is None
+            and self.action_router is not None
+        ):
+            outcome = await self.action_router.route(text)
+            if outcome.decision is not None:
+                decision = outcome.decision
+            elif outcome.learnable_hint is not None and self.skill_teacher is not None:
+                # Nothing in the registry covers this, but the phrasing
+                # reads like something Bob could reasonably be taught
+                # ("coloque um timer") rather than plain chit-chat -- start
+                # a teaching attempt instead of just shrugging it off as
+                # unrecognized dialogue.
+                result = await self.skill_teacher.start(text)
+                reply = self._apply_teach_result(result, original_utterance=text)
+                return self._learning_turn_result(text, reply, person, person_id)
+        intent_latency_ms = round((time.monotonic() - intent_started) * 1000, 1)
 
         context = self.context_builder.build(
             person=person,
@@ -90,12 +164,20 @@ class RobotAgent:
             emotion=self.emotional_engine.state,
         )
 
+        planning_started = time.monotonic()
         plan = self.planner.plan(decision)
+        planning_latency_ms = round((time.monotonic() - planning_started) * 1000, 1)
+        action_started = time.monotonic()
         action_records = await self.executor.execute_many(plan.valid_actions)
+        action_latency_ms = round((time.monotonic() - action_started) * 1000, 1)
 
         for record in action_records:
             event = EmotionEvent.SUCCESSFUL_ACTION if record.outcome and record.outcome.success else EmotionEvent.FAILED_ACTION
             self.emotional_engine.apply_event(event)
+            self.event_bus.publish(
+                EventType.ACTION_COMPLETED if record.outcome and record.outcome.success else EventType.ACTION_FAILED,
+                {"action": record.name, "success": bool(record.outcome and record.outcome.success)},
+            )
 
         if decision.memory_candidate:
             importance = score_candidate(decision.memory_candidate)
@@ -108,10 +190,18 @@ class RobotAgent:
                 )
             )
 
+        response_started = time.monotonic()
         reply = await self.response_engine.generate(decision, context, action_records)
+        response_latency_ms = round((time.monotonic() - response_started) * 1000, 1)
         self.short_term.add(Turn(speaker="robot", text=reply, person_id=person_id))
 
         latency_ms = round((time.monotonic() - start) * 1000, 1)
+        behavior_event = (
+            "conversation_interesting"
+            if decision.type in (IntentType.DIALOGUE, IntentType.QUESTION)
+            else "user_command"
+        )
+        behavior_proposals = self.behavior_engine.evaluate(behavior_event, self.world_state)
 
         self.event_sink(
             BrainEvent(
@@ -132,10 +222,81 @@ class RobotAgent:
                         else "partial_or_failed"
                     ),
                     "latency_ms": latency_ms,
+                    "intent_latency_ms": intent_latency_ms,
+                    "planning_latency_ms": planning_latency_ms,
+                    "action_latency_ms": action_latency_ms,
+                    "response_latency_ms": response_latency_ms,
+                    "behavior_proposals": ", ".join(p.name for p in behavior_proposals) or "none",
                 },
             )
         )
 
         self.emotional_engine.save()
+        self.world_state.finish_turn()
+        self.event_bus.publish(EventType.ROBOT_RESPONSE_FINISHED, {"person_id": person_id or "unknown"})
 
-        return TurnResult(reply=reply, decision=decision, action_records=action_records, person=person)
+        return TurnResult(
+            reply=reply,
+            decision=decision,
+            action_records=action_records,
+            person=person,
+            behavior_proposals=behavior_proposals,
+        )
+
+    def propose_initiative(self, event_type: str) -> BehaviorProposal | None:
+        proposals = self.behavior_engine.evaluate(event_type, self.world_state)
+        return self.initiative_engine.select(proposals, self.world_state)
+
+    async def _continue_learning(self, text: str) -> str:
+        """The turn following either a clarifying question or an approval
+        request -- interprets `text` against whichever one is pending."""
+        state = self.learning_state
+        if state.awaiting_approval:
+            answer = classify_yes_no(text)
+            if answer is True and state.pending_record is not None and self.skill_teacher is not None:
+                self.skill_teacher.approve(state.pending_record)
+                reply = f"Aprendi: {state.pending_record.description}."
+            elif answer is False:
+                reply = "Combinado, não vou aprender isso."
+            else:
+                # An approval question got an unclear answer -- never guess
+                # consent for something the system itself flagged as
+                # needing a yes.
+                reply = "Não entendi se era pra aprender ou não, vou deixar quieto por enquanto."
+            state.reset()
+            return reply
+
+        if self.skill_teacher is None:
+            state.reset()
+            return "Não consigo aprender coisas novas agora."
+        result = await self.skill_teacher.continue_with_answer(
+            state.original_utterance, state.clarifying_question or "", text,
+        )
+        return self._apply_teach_result(result, original_utterance=state.original_utterance)
+
+    def _apply_teach_result(self, result: SkillTeachResult, *, original_utterance: str) -> str:
+        state = self.learning_state
+        if result.status is SkillTeachStatus.NEEDS_CLARIFICATION:
+            state.active = True
+            state.original_utterance = original_utterance
+            state.clarifying_question = result.message
+            state.awaiting_approval = False
+            state.pending_record = None
+            return learning_clarify(result.message)
+        if result.status is SkillTeachStatus.READY_FOR_APPROVAL:
+            state.active = True
+            state.original_utterance = original_utterance
+            state.awaiting_approval = True
+            state.pending_record = result.record
+            return result.message
+        # LEARNED or FAILED both end the attempt.
+        state.reset()
+        return result.message
+
+    def _learning_turn_result(self, text: str, reply: str, person: PersonProfile | None, person_id: str | None) -> TurnResult:
+        self.short_term.add(Turn(speaker="robot", text=reply, person_id=person_id))
+        self.emotional_engine.save()
+        self.world_state.finish_turn()
+        self.event_bus.publish(EventType.ROBOT_RESPONSE_FINISHED, {"person_id": person_id or "unknown"})
+        decision = Decision(type=IntentType.QUESTION, confidence=0.9, raw_text=text)
+        return TurnResult(reply=reply, decision=decision, person=person)

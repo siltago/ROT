@@ -37,11 +37,14 @@ class ContextBuilder:
     ) -> TurnContext:
         style = build_style_guide(personality, emotion, person)
         memories = self.long_term.for_person(person.id) if person else []
+        # Most important, then most recent -- "relevant" should mean more
+        # than just "last inserted"; a durable preference outranks small talk.
+        ranked = sorted(memories, key=lambda m: (m.importance, m.created_at), reverse=True)
         return TurnContext(
             person=person,
             personality=personality,
             emotion=emotion,
             style=style,
             recent_dialogue=self.short_term.as_context_text(),
-            relevant_memories=memories[-5:],
+            relevant_memories=ranked[:4],
         )

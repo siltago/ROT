@@ -12,8 +12,10 @@ void main() {
     final start = DateTime(2025);
 
     expect(detector.update(0.2, start), SpeechEvent.started);
-    expect(detector.update(0.3, start.add(const Duration(milliseconds: 50))), isNull);
-    expect(detector.update(0, start.add(const Duration(milliseconds: 400))), isNull);
+    expect(detector.update(0.3, start.add(const Duration(milliseconds: 50))),
+        isNull);
+    expect(detector.update(0, start.add(const Duration(milliseconds: 400))),
+        isNull);
     expect(
       detector.update(0, start.add(const Duration(milliseconds: 600))),
       SpeechEvent.ended,

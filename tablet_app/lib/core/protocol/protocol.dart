@@ -32,7 +32,8 @@ class RobotMessage {
       version: (json['version'] as num?)?.toInt() ?? 1,
       type: (json['type'] ?? '').toString(),
       deviceId: (json['device_id'] ?? 'tablet_001').toString(),
-      timestamp: (json['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+      timestamp: (json['timestamp'] as num?)?.toInt() ??
+          DateTime.now().millisecondsSinceEpoch,
       payload: rawPayload is Map
           ? Map<String, dynamic>.from(rawPayload)
           : const <String, dynamic>{},
@@ -41,6 +42,68 @@ class RobotMessage {
 }
 
 class RobotMessageFactory {
+  static RobotMessage audioStreamStart({
+    required String deviceId,
+    required String streamId,
+    required int sampleRate,
+    required int channels,
+    required int chunkMs,
+  }) =>
+      RobotMessage(
+        version: 1,
+        type: 'audio_stream_start',
+        deviceId: deviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        payload: {
+          'stream_id': streamId,
+          'format': {
+            'encoding': 'pcm_s16le',
+            'sample_rate': sampleRate,
+            'channels': channels,
+            'bit_depth': 16,
+            'chunk_ms': chunkMs,
+          },
+        },
+      );
+
+  static RobotMessage audioStreamEnd({
+    required String deviceId,
+    required String streamId,
+  }) =>
+      RobotMessage(
+        version: 1,
+        type: 'audio_stream_end',
+        deviceId: deviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        payload: {'stream_id': streamId},
+      );
+
+  static RobotMessage audioStreamCancel({
+    required String deviceId,
+    required String streamId,
+    required String reason,
+  }) =>
+      RobotMessage(
+        version: 1,
+        type: 'audio_stream_cancel',
+        deviceId: deviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        payload: {'stream_id': streamId, 'reason': reason},
+      );
+
+  /// Tells the brain the tablet has actually finished playing the last
+  /// speech (greeting or reply) and resumed its mic -- the real end of a
+  /// turn, so the brain doesn't have to guess/estimate how long that took
+  /// before arming its wake-inactivity timer or moving on.
+  static RobotMessage speechPlaybackDone({required String deviceId}) =>
+      RobotMessage(
+        version: 1,
+        type: 'speech_playback_done',
+        deviceId: deviceId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        payload: const {},
+      );
+
   static RobotMessage hello({
     required String deviceId,
     required List<String> capabilities,
@@ -56,21 +119,29 @@ class RobotMessageFactory {
     );
   }
 
-  static RobotMessage speechStarted({required String deviceId}) {
+  static RobotMessage speechStarted({
+    required String deviceId,
+    String? streamId,
+  }) {
     return RobotMessage(
       version: 1,
       type: 'speech_started',
       deviceId: deviceId,
       timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: streamId == null ? null : {'stream_id': streamId},
     );
   }
 
-  static RobotMessage speechEnded({required String deviceId}) {
+  static RobotMessage speechEnded({
+    required String deviceId,
+    String? streamId,
+  }) {
     return RobotMessage(
       version: 1,
       type: 'speech_ended',
       deviceId: deviceId,
       timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: streamId == null ? null : {'stream_id': streamId},
     );
   }
 
