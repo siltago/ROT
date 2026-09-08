@@ -1,7 +1,7 @@
 name: robot_tablet_app
 description: Android-first tablet client for Robot Brain.
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.1.0+32
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -33,6 +33,18 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # Exact reference art for a couple of idle-vignette props (reading
+  # glasses, the coffee mug) -- used in place of the earlier hand-drawn
+  # CustomPainter versions of those two.
+  assets:
+    - assets/images/glasses.png
+    - assets/images/mug.png
+    - assets/images/headphones.png
+    # Directory form (not individual files): picks up whatever's
+    # actually present at build time instead of erroring on a food
+    # image that hasn't been dropped in yet (see idle_feed_overlay.dart,
+    # which falls back to an emoji for any key without a real asset).
+    - assets/images/food/
   # Lyric Mode's per-mood typography (see _MoodStyle in
   # presentation_scene_widget.dart) -- deliberately distinct from the
   # Android system font, all OFL-licensed (see assets/fonts/OFL.txt).

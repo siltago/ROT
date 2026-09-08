@@ -16,6 +16,7 @@ from actions.music import player as music_actions
 from actions.permissions import PermissionPolicy, auto_deny
 from actions.registry import ActionRegistry
 from actions.robot import movement as robot_actions
+from actions.robot import play as play_actions
 from actions.smart_home import lights as light_actions
 from actions.smart_home import security as security_actions
 from actions.smart_home import devices as smart_home_actions
@@ -29,6 +30,7 @@ from brain.decision_engine import DecisionEngine
 from brain.planner import Planner
 from brain.response_engine import ResponseEngine
 from emotions.engine import EmotionalEngine
+from emotions.needs import NeedsEngine, NeedsStore
 from emotions.state import EmotionalStateStore
 from hardware.simulator import SimulatorHardware
 from integrations.llm.base import LLMProvider
@@ -80,6 +82,22 @@ def build_skills_repository() -> Repository:
     return InMemoryRepository()
 
 
+def build_needs_repository() -> Repository:
+    """Same shape as build_skills_repository() -- Supabase-backed when
+    configured, falling back to a non-persistent in-memory store so the
+    rest of the app still runs before that's set up (hunger just won't
+    survive a restart until it is)."""
+    if settings.supabase_url and settings.supabase_key:
+        from supabase import create_client
+
+        from memory.supabase_repository import SupabaseRepository
+
+        client = create_client(settings.supabase_url, settings.supabase_key)
+        return SupabaseRepository(client, table_name="robot_needs")
+    logger.warning("SUPABASE_URL/SUPABASE_KEY not set -- robot needs won't persist across restarts")
+    return InMemoryRepository()
+
+
 def build_llm_provider() -> LLMProvider | None:
     if not settings.llm_enabled:
         return None
@@ -108,6 +126,7 @@ def build_agent(
     music_actions.register(registry, music_service)
     alexa_actions.register(registry)
     robot_actions.register(registry, hardware)
+    play_actions.register(registry)
     weather_provider = OpenMeteoWeatherProvider(
         float(settings.robot_latitude) if settings.robot_latitude else None,
         float(settings.robot_longitude) if settings.robot_longitude else None,
@@ -138,6 +157,7 @@ def build_agent(
 
     personality = Personality.load(settings.personality_file)
     emotional_engine = EmotionalEngine(EmotionalStateStore.load(settings.emotional_state_file))
+    needs_engine = NeedsEngine(NeedsStore(build_needs_repository()))
 
     llm_provider = build_llm_provider()
     response_engine = ResponseEngine(llm_provider=llm_provider)
@@ -162,6 +182,7 @@ def build_agent(
         response_engine=response_engine,
         personality=personality,
         emotional_engine=emotional_engine,
+        needs_engine=needs_engine,
         people=people,
         long_term=long_term,
         short_term=short_term,

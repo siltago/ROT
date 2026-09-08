@@ -6,7 +6,12 @@ from integrations.music.models import PlaybackState
 
 
 class SpotifyError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        # Spotify's own `Retry-After` header on a 429, in seconds, when it
+        # sent one -- the real, authoritative backoff window instead of a
+        # guess. None when absent or the error wasn't a 429.
+        self.retry_after = retry_after
 
 
 # Strips leading connector words ("da banda X", "do grupo X" -> "X") from a
@@ -144,7 +149,14 @@ class SpotifyProvider:
             return await asyncio.to_thread(self._open_json, req)
         except urllib.error.HTTPError as exc:
             if exc.code == 204: return None
-            raise SpotifyError(f"Spotify respondeu HTTP {exc.code}: {exc.read().decode(errors='replace')[:180]}") from exc
+            retry_after = None
+            if exc.code == 429:
+                with suppress(TypeError, ValueError):
+                    retry_after = float(exc.headers.get("Retry-After")) if exc.headers else None
+            raise SpotifyError(
+                f"Spotify respondeu HTTP {exc.code}: {exc.read().decode(errors='replace')[:180]}",
+                retry_after=retry_after,
+            ) from exc
 
     def _open_json(self, req):
         with urllib.request.urlopen(req, timeout=self.timeout) as response:

@@ -34,8 +34,14 @@ class ContextBuilder:
         person: PersonProfile | None,
         personality: PersonalityTraits,
         emotion: EmotionalState,
+        hunger: float = 0.0,
+        idle_seconds: float = 0.0,
+        current_activity: str | None = None,
     ) -> TurnContext:
-        style = build_style_guide(personality, emotion, person)
+        style = build_style_guide(
+            personality, emotion, person,
+            hunger=hunger, idle_seconds=idle_seconds, current_activity=current_activity,
+        )
         memories = self.long_term.for_person(person.id) if person else []
         # Most important, then most recent -- "relevant" should mean more
         # than just "last inserted"; a durable preference outranks small talk.

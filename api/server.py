@@ -14,10 +14,12 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
@@ -27,7 +29,9 @@ from brain.behaviors import BehaviorProposal
 from brain.cognition import CognitionEngine
 from brain.models import IntentType
 from brain.events import EventType, RobotEvent
+from emotions.events import EmotionEvent
 from emotions.state import EmotionalState
+from integrations.music.spotify import SpotifyError
 from integrations.stt.openai_realtime import OpenAIRealtimeSttProvider
 from integrations.tts.piper_provider import PiperTtsProvider, RobotVoiceEffect
 from perception.event_sources import ClockEventSource
@@ -44,6 +48,169 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Subjects the "doodling" idle vignette can be told to draw (see
+# GET /idle/doodle_subject) -- kept in sync by hand with the tablet's own
+# small library of recognizable line-drawings for each one
+# (idle_doodle_overlay.dart's `_subjectDrawings`).
+# A full swing of natural tiredness (fully rested <-> fully exhausted)
+# takes about 10 hours -- see _cognition_tick_loop's energy rate-limit.
+_MAX_ENERGY_CHANGE_PER_HOUR = 1.0 / 10
+# Kept in sync by hand with tablet_app's _idleActivityRestfulness
+# (robot_app.dart) -- which idle vignette kinds count as "genuinely
+# engaged/playing" (relieves boredom) vs. "genuinely resting" (speeds up
+# energy recovery), reported to the backend via idle_activity_report
+# messages (see DeviceSession.active_idle_kind).
+_ACTIVE_IDLE_KINDS = {"snake", "checkers", "chess", "doodle", "humming"}
+_RESTING_IDLE_KINDS = {"resting", "coffee"}
+# How much faster energy recovers while genuinely resting/having a
+# coffee, on top of (not instead of) the natural pace above.
+_RESTING_ENERGY_RECOVERY_PER_HOUR = 0.35
+
+# How long to stop polling Spotify after it responds 429 (rate limited)
+# -- doubles on each consecutive 429 up to the cap. See _music_sync_loop.
+_SPOTIFY_RATE_LIMIT_BACKOFF_SECONDS = 60.0
+_SPOTIFY_RATE_LIMIT_MAX_BACKOFF_SECONDS = 600.0
+# Ambient-listening/offer detection and presenting-mode position sync
+# only actually call Spotify on every Nth tick of _music_sync_loop
+# (which otherwise runs every MUSIC_POLL_SECONDS, ~1s by default) -- see
+# _music_sync_loop. The tablet already extrapolates position locally
+# between syncs, so this doesn't cost smoothness, just quota.
+_AMBIENT_POLL_EVERY_N_TICKS = 5
+_PRESENTING_POLL_EVERY_N_TICKS = 5
+
+_DOODLE_SUBJECTS = [
+    "casa", "estrela", "coracao", "sol", "nuvem",
+    "arvore", "gato", "peixe", "flor", "robo",
+]
+
+# What the "reading" idle vignette can teach, no LLM call involved (same
+# "cheap consult" spirit as _DOODLE_SUBJECTS) -- each nudges one existing
+# PersonalityTraits field a tiny amount (small and slow on purpose: many
+# reading sessions to meaningfully shift, not a personality rewrite) and
+# hands the doodle overlay something concrete to try drawing next,
+# tying "he read about it" to "he tries to draw it" -- see
+# /reading/learn and /idle/doodle_subject.
+_READING_LESSONS = [
+    {"topic": "sarcasmo", "trait": "sarcasm", "delta": 0.01, "subject": "gato"},
+    {"topic": "lógica", "trait": "confidence", "delta": 0.008, "subject": "estrela"},
+    {"topic": "humor", "trait": "humor", "delta": 0.01, "subject": "sol"},
+    {"topic": "empatia", "trait": "affection", "delta": 0.008, "subject": "coracao"},
+    {"topic": "concisão", "trait": "verbosity", "delta": -0.008, "subject": "nuvem"},
+    {"topic": "curiosidade científica", "trait": "curiosity", "delta": 0.008, "subject": "arvore"},
+]
+
+# A tiny, dependency-free page (no CDN, works fine offline on the LAN):
+# drag a food up to feed the robot. Deliberately plain HTML/CSS/JS instead
+# of a build step -- this is a five-minute chore page, not an app.
+_FEED_PAGE_HTML = """<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alimentar o Bob</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: flex-end; gap: 24px; padding: 24px;
+    background: radial-gradient(circle at 50% 0%, #1a2138, #070b16 70%);
+    font-family: -apple-system, Roboto, sans-serif; color: #eef1fb; touch-action: none;
+    overflow: hidden;
+  }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.4px; opacity: 0.75; margin: 0 0 4px; }
+  #hint { font-size: 13px; opacity: 0.5; margin: 0 0 8px; text-align: center; }
+  #tray {
+    display: flex; gap: 14px; flex-wrap: wrap; justify-content: center;
+    padding-bottom: env(safe-area-inset-bottom, 12px);
+  }
+  .food {
+    width: 78px; display: flex; flex-direction: column; align-items: center;
+    gap: 6px; touch-action: none; cursor: grab;
+    transition: transform 0.15s ease;
+  }
+  .food-card {
+    width: 78px; height: 78px; display: flex; align-items: center;
+    justify-content: center; border-radius: 22px;
+    background: linear-gradient(160deg, rgba(255,255,255,0.1), rgba(255,255,255,0.03));
+    border: 1px solid rgba(255,255,255,0.14);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+  }
+  .food img { width: 52px; height: 52px; object-fit: contain; pointer-events: none; }
+  .food span {
+    font-size: 11px; opacity: 0.6; letter-spacing: 0.2px; text-transform: lowercase;
+  }
+  .food.dragging { transition: none; z-index: 10; }
+  .food.dragging .food-card {
+    background: linear-gradient(160deg, rgba(46,230,166,0.28), rgba(255,255,255,0.05));
+    box-shadow: 0 10px 26px rgba(46,230,166,0.25);
+  }
+  #toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%) translateY(-140%);
+    background: #2ee6a6; color: #06251b; font-weight: 700; padding: 10px 18px;
+    border-radius: 999px; font-size: 14px; transition: transform 0.35s ease; white-space: nowrap;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+  <h1>🤖 alimentar o Bob</h1>
+  <p id="hint">arraste uma comida pra cima</p>
+  <div id="toast">alimentado! 🍽️</div>
+  <div id="tray">__FOOD_TRAY__</div>
+<script>
+const toast = document.getElementById('toast');
+function showToast() {
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 1400);
+}
+async function feed(food) {
+  try {
+    await fetch('/feed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ food }),
+    });
+    showToast();
+  } catch (e) {
+    // Offline/unreachable -- silently do nothing, nothing worth
+    // surfacing to a casual drag-to-feed gesture.
+  }
+}
+const THRESHOLD = 90;
+document.querySelectorAll('.food').forEach((el) => {
+  let startY = 0, dragging = false, ignited = false;
+  const reset = () => {
+    el.classList.remove('dragging');
+    el.style.transform = '';
+    el.style.opacity = '';
+    dragging = false; ignited = false;
+  };
+  el.addEventListener('pointerdown', (e) => {
+    startY = e.clientY; dragging = true; ignited = false;
+    el.classList.add('dragging');
+    el.setPointerCapture(e.pointerId);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dy = startY - e.clientY;
+    if (dy > 0) {
+      el.style.transform = `translateY(${-dy}px) scale(${1 + Math.min(dy, THRESHOLD) / THRESHOLD * 0.3})`;
+      el.style.opacity = String(Math.max(0.2, 1 - dy / (THRESHOLD * 2)));
+    }
+    if (dy > THRESHOLD && !ignited) {
+      ignited = true;
+      feed(el.dataset.food);
+    }
+  });
+  el.addEventListener('pointerup', reset);
+  el.addEventListener('pointercancel', reset);
+});
+</script>
+</body>
+</html>"""
+
 
 class DeviceMessage(BaseModel):
     version: int = 1
@@ -57,6 +224,26 @@ class DebugEventRequest(BaseModel):
     type: EventType
     source: str = "debug_api"
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class FeedRequest(BaseModel):
+    food: str = "apple"
+
+
+# Same 5 keys/images the tablet already bundles as
+# tablet_app/assets/images/food/<key>.png (see idle_feed_overlay.dart's
+# foodEmojiFallback, kept in sync by hand) -- reused here so the /feed
+# page shows the real artwork instead of generic emoji, and so
+# GET /feed/img/<key> has a closed set of valid keys to serve (never an
+# arbitrary path from the request).
+_FEED_FOOD_ASSETS_DIR = Path(__file__).resolve().parent.parent / "tablet_app" / "assets" / "images" / "food"
+_FEED_FOODS: tuple[tuple[str, str], ...] = (
+    ("apple", "maçã"),
+    ("pizza", "pizza"),
+    ("cookie", "cookie"),
+    ("burger", "burger"),
+    ("chocolate", "chocolate"),
+)
 
 
 def outgoing_message(message_type: str, device_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -110,6 +297,22 @@ class DeviceSession:
     # back to it. `awake` is set alongside this so the mic stays listening
     # for the reply exactly like a normal wake.
     pending_music_offer: str = ""
+    # Which idle self-entertainment vignette this device is currently
+    # showing (as picked client-side, see robot_app.dart's
+    # _pickIdleActivity), reported via `idle_activity_report` messages --
+    # None while nothing's showing. Read by _cognition_tick_loop so
+    # "resting"/"coffee" actually restore energy faster, and the active
+    # cluster actually relieves boredom, instead of the vignette being
+    # purely cosmetic.
+    active_idle_kind: str | None = None
+    # The last non-null active_idle_kind, kept even after it's dismissed
+    # (e.g. by the wake word that's about to start a conversation about
+    # it) -- being called over *is* what clears active_idle_kind, so
+    # relying on that alone would make "o que você estava fazendo?"
+    # always answer "nothing" right when it's asked. Used only for
+    # _current_activity_label; never read by the engagement/energy
+    # calculations above, which should see the interruption as real.
+    last_idle_kind: str | None = None
 
 
 class DeviceRegistry:
@@ -315,6 +518,56 @@ class TabletBrainBridge:
         self.presentation_planner = PresentationPlanner()
         self._turn_lock = asyncio.Lock()
 
+    # Kept in sync by hand with tablet_app's _idleActivityKinds
+    # (robot_app.dart) -- human labels for "o que você está fazendo?" to
+    # actually be answerable. "reading" is filled in dynamically below
+    # (mentions the actual topic, if there is one).
+    _IDLE_ACTIVITY_LABELS = {
+        "snake": "brincando com um joguinho de cobrinha",
+        "checkers": "jogando damas sozinho",
+        "chess": "jogando xadrez sozinho",
+        "resting": "descansando",
+        "bored": "meio entediado, sem nada de especial pra fazer",
+        "coffee": "tomando um café",
+        "humming": "cantarolando alguma coisa",
+        "doodle": "rabiscando um desenho",
+    }
+
+    def _current_activity_label(self, device_id: str) -> str | None:
+        """A human-readable answer to "o que você está fazendo?" -- from
+        the idle vignette the device last reported showing (see
+        DeviceSession.active_idle_kind, set by `idle_activity_report`
+        messages). Being called (the wake word) is exactly what dismisses
+        the idle vignette client-side, clearing active_idle_kind right
+        before this turn even starts -- so this falls back to
+        `last_idle_kind` (which isn't cleared on dismissal) and phrases
+        it in the past tense, rather than always answering "nothing"
+        the moment it's actually asked. None only when neither is set/no
+        session is known.
+        """
+        if self.registry is None:
+            return None
+        session = self.registry.get(device_id)
+        if session is None:
+            return None
+        if session.active_idle_kind is not None:
+            return self._activity_phrase(session.active_idle_kind, ongoing=True)
+        if session.last_idle_kind is not None:
+            return self._activity_phrase(session.last_idle_kind, ongoing=False)
+        return None
+
+    def _activity_phrase(self, kind: str, *, ongoing: bool) -> str | None:
+        if kind == "reading":
+            topic = self.agent.needs_engine.state.last_read_topic
+            base = f"lendo sobre {topic}" if topic else "lendo"
+        else:
+            base = self._IDLE_ACTIVITY_LABELS.get(kind)
+        if base is None:
+            return None
+        if ongoing:
+            return base
+        return f"{base} até agora, mas parou pra te dar atenção"
+
     async def process_text(self, *, text: str, device_id: str, send: SendMessage, send_bytes: SendBytes) -> None:
         cleaned = text.strip()
         if not cleaned:
@@ -329,8 +582,9 @@ class TabletBrainBridge:
             )
         )
         try:
+            current_activity = self._current_activity_label(device_id)
             async with self._turn_lock:
-                result = await self.agent.process_turn(cleaned)
+                result = await self.agent.process_turn(cleaned, current_activity=current_activity)
                 state = self.agent.emotional_engine.state
                 mood = state.mood_label()
             expression = expression_for_result(result, mood)
@@ -357,6 +611,16 @@ class TabletBrainBridge:
             scene = self.presentation_planner.plan(result)
             if scene is not None:
                 await send(outgoing_message("show_scene", device_id, scene.to_payload()))
+            # "vai jogar"/"joga um pouco" etc. route to idle.play_now (see
+            # actions/robot/play.py), which has no side effect of its own
+            # -- this is what actually starts a self-entertainment
+            # vignette on command, the same message PlayfulIdleBehavior
+            # sends autonomously after enough idle time (_dispatch_selected).
+            if any(
+                record.name == "idle.play_now" and record.outcome and record.outcome.success
+                for record in result.action_records
+            ):
+                await send(outgoing_message("play_idle_animation", device_id))
             # Wait for the tablet's own signal that it's actually done
             # playing the reply before returning -- otherwise the caller's
             # post-turn wake-timeout re-arm starts its countdown while the
@@ -831,20 +1095,61 @@ async def _cognition_tick_loop(
             was_active = world.processing or world.conversation_active
             drives = agent.cognition.drive_engine.advance(interval, active=was_active)
 
-            emotional_state = agent.emotional_engine.state
-            target_energy = _clamp01(1 - drives.rest)
-            emotional_state.energy = _clamp01(
-                emotional_state.energy + (target_energy - emotional_state.energy) * 0.15
-            )
-
-            sessions = registry.sessions()
-            for session in sessions:
-                await session.websocket.send_json(
-                    outgoing_message("set_expression", session.device_id, emotional_state.model_dump())
-                )
+            active_idle_kinds = {
+                s.active_idle_kind for s in registry.sessions() if s.active_idle_kind
+            }
+            is_engaged = bool(active_idle_kinds & _ACTIVE_IDLE_KINDS)
+            is_resting = bool(active_idle_kinds & _RESTING_IDLE_KINDS)
+            needs = agent.needs_engine.advance(interval, engaged=is_engaged)
+            agent.needs_engine.save()
 
             last = world.activity.last_interaction_at or world.activity.active_since
             idle_seconds = (datetime.now(timezone.utc) - last).total_seconds()
+
+            emotional_state = agent.emotional_engine.state
+            # Natural pacing: energy drifts toward its rest-driven target
+            # at a fixed, slow rate (~10%/hour -- a full swing takes about
+            # 10 hours) regardless of how far off it starts. Rate-limited,
+            # not smoothed toward the target -- a percentage smoothing
+            # pull (e.g. "15% of the gap per tick") converges in minutes
+            # no matter the starting gap, which reads as tiredness
+            # swinging almost instantly.
+            natural_target = _clamp01(1 - drives.rest)
+            max_energy_step = _MAX_ENERGY_CHANGE_PER_HOUR * (interval / 3600)
+            energy_delta = natural_target - emotional_state.energy
+            energy_step = max(-max_energy_step, min(max_energy_step, energy_delta))
+            emotional_state.energy = _clamp01(emotional_state.energy + energy_step)
+            # Hunger is an external factor, not part of the natural pace
+            # above -- it drains energy directly, uncapped by the 10%/h
+            # limit, so being genuinely hungry can tire the robot out
+            # faster than resting alone ever would.
+            emotional_state.energy = _clamp01(
+                emotional_state.energy - needs.hunger * 0.15 * (interval / 3600)
+            )
+            # Actually resting/having a coffee genuinely speeds up
+            # recovery, well past the natural 10%/h pace above -- so the
+            # answer to "does resting help him recover?" is yes.
+            if is_resting:
+                emotional_state.energy = _clamp01(
+                    emotional_state.energy + _RESTING_ENERGY_RECOVERY_PER_HOUR * (interval / 3600)
+                )
+            # Being hungry AND idle for a while compounds into irritation --
+            # neither alone is enough to trigger this.
+            if needs.hunger > 0.6 and idle_seconds > 300:
+                emotional_state.irritation = _clamp01(
+                    emotional_state.irritation + needs.hunger * 0.02 * (interval / 3600)
+                )
+
+            sessions = registry.sessions()
+            for session in sessions:
+                payload = emotional_state.model_dump()
+                payload["hunger"] = needs.hunger
+                payload["boredom"] = needs.boredom
+                payload["idle_seconds"] = idle_seconds
+                await session.websocket.send_json(
+                    outgoing_message("set_expression", session.device_id, payload)
+                )
+
             result = await agent.cognition.process_event(
                 RobotEvent(type=EventType.IDLE_TIMEOUT, source="cognition_tick", data={"idle_seconds": idle_seconds})
             )
@@ -885,26 +1190,58 @@ async def _music_sync_loop(
     # only gets shown the scene from the transition that actually turned
     # it on; it won't retroactively join an already-running one.
     presenting_audience: set[str] = set()
+    # Whether the "headphones on, listening along" face is currently
+    # showing -- set_ambient_listening is actually re-sent every tick
+    # (see below), this is just kept for the "presenting just started"
+    # reset above.
+    was_ambient_listening = False
+    # Consecutive 429s from Spotify -- backs off longer each time
+    # (capped) instead of retrying at a fixed interval that keeps
+    # tripping the same limit right back.
+    rate_limit_backoff_streak = 0
+    # Ambient detection (headphones/offer) doesn't need per-second
+    # freshness the way position-synced lyrics while presenting does --
+    # only actually polling Spotify for it every few ticks meaningfully
+    # cuts total request volume against Spotify's (fairly tight,
+    # Development-Mode) quota.
+    ambient_poll_counter = 0
+    # The presenting-mode poll doesn't need per-second freshness either --
+    # the tablet already extrapolates position locally between updates
+    # (see this function's own docstring) and corrects on the next
+    # sync, so a slower sync cadence here just means a slightly longer
+    # worst-case correction delay, not a less smooth player.
+    presenting_poll_counter = 0
     while True:
         try:
+            # Once the robot is presenting its own player, it's not
+            # "listening along" anymore -- turn the headphones back off.
+            if service.presenting and was_ambient_listening:
+                was_ambient_listening = False
+                for session in registry.sessions():
+                    await session.websocket.send_json(outgoing_message(
+                        "set_ambient_listening", session.device_id, {"listening": False}))
+
             # Only mirror playback onto the tablet while the robot itself is
             # the one presenting it (see `MusicExperienceService.presenting`)
             # -- otherwise this loop would show whatever happens to be
             # playing on the user's own Spotify session (phone, PC...)
             # any time it's active, which nobody asked the robot to display.
+            presenting_poll_counter += 1
             if service.presenting:
-                if not was_presenting:
+                just_started = not was_presenting
+                if just_started:
                     presenting_audience = {s.device_id for s in registry.sessions()}
-                payload = await service.current_payload()
-                if payload is None:
-                    service.presenting = False
-                else:
-                    was_presenting = True
-                    scene = {"kind": "music", "variant": payload["mode"], "persistent": True, "data": payload}
-                    for session in registry.sessions():
-                        if session.device_id not in presenting_audience:
-                            continue
-                        await session.websocket.send_json(outgoing_message("show_scene", session.device_id, scene))
+                if just_started or presenting_poll_counter % _PRESENTING_POLL_EVERY_N_TICKS == 0:
+                    payload = await service.current_payload()
+                    if payload is None:
+                        service.presenting = False
+                    else:
+                        was_presenting = True
+                        scene = {"kind": "music", "variant": payload["mode"], "persistent": True, "data": payload}
+                        for session in registry.sessions():
+                            if session.device_id not in presenting_audience:
+                                continue
+                            await session.websocket.send_json(outgoing_message("show_scene", session.device_id, scene))
             if not service.presenting and was_presenting:
                 was_presenting = False
                 for session in registry.sessions():
@@ -913,12 +1250,30 @@ async def _music_sync_loop(
                     await session.websocket.send_json(outgoing_message(
                         "dismiss_scene", session.device_id, {"reason": "spotify_stopped"}))
                 presenting_audience = set()
-            if not service.presenting:
+            ambient_poll_counter += 1
+            if not service.presenting and ambient_poll_counter % _AMBIENT_POLL_EVERY_N_TICKS == 0:
                 # Playing somewhere else (phone, PC...) and the robot hasn't
                 # been asked for it -- offer once per track instead of either
                 # silently ignoring it or showing up uninvited.
                 ambient = await service.current_payload()
-                if ambient is not None and service.should_offer(ambient["track_id"]):
+                offer_now = service.should_offer(ambient is not None)
+                # "Listening along": puts headphones on Bob's face while
+                # someone else's playback is going, independent of the
+                # voice offer above (which only fires once per session/
+                # time-window) -- this just tracks whether ambient
+                # playback is happening right now.
+                # Sent every tick (not just on change) -- same pattern as
+                # set_expression below. A device that (re)connects after
+                # the state already flipped would otherwise never learn
+                # the current value until the next actual change, which
+                # could be a long wait.
+                is_ambient_listening = ambient is not None
+                was_ambient_listening = is_ambient_listening
+                for session in registry.sessions():
+                    await session.websocket.send_json(outgoing_message(
+                        "set_ambient_listening", session.device_id,
+                        {"listening": is_ambient_listening}))
+                if ambient is not None and offer_now:
                     for session in registry.sessions():
                         if session.awake or session.pending_music_offer:
                             continue
@@ -939,10 +1294,47 @@ async def _music_sync_loop(
                             )
                         except Exception:
                             logger.warning("Failed to offer music scene to %s", session.device_id, exc_info=True)
+            rate_limit_backoff_streak = 0
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning("Spotify sync temporarily unavailable", exc_info=True)
+            # Can't confirm ambient playback is still happening (or ever
+            # resume confirming it, e.g. mid rate-limit backoff, which can
+            # run for hours per Spotify's own Retry-After) -- fail safe to
+            # "not listening" rather than leaving the headphones stuck
+            # showing whatever the last successful poll happened to see.
+            # Sent unconditionally (not just on a tracked True->False
+            # transition): a session that connected *during* an ongoing
+            # failure never got a real update at all, and could be
+            # showing a stale True from before this process even started.
+            was_ambient_listening = False
+            for session in registry.sessions():
+                await session.websocket.send_json(outgoing_message(
+                    "set_ambient_listening", session.device_id, {"listening": False}))
+            if "429" in str(exc):
+                # Spotify is rate-limiting this app -- polling every tick
+                # regardless would just keep tripping the same limit right
+                # back (as a fixed short backoff did in practice). Prefer
+                # Spotify's own Retry-After (the real, authoritative
+                # window) when it sent one; otherwise fall back to
+                # doubling each consecutive 429, capped at 10 minutes.
+                rate_limit_backoff_streak += 1
+                if isinstance(exc, SpotifyError) and exc.retry_after:
+                    backoff = exc.retry_after
+                    source = "Retry-After"
+                else:
+                    backoff = min(
+                        _SPOTIFY_RATE_LIMIT_MAX_BACKOFF_SECONDS,
+                        _SPOTIFY_RATE_LIMIT_BACKOFF_SECONDS * (2 ** (rate_limit_backoff_streak - 1)),
+                    )
+                    source = "exponential fallback"
+                logger.warning(
+                    "Spotify rate-limited (429) -- backing off %.0fs via %s (streak=%d)",
+                    backoff, source, rate_limit_backoff_streak,
+                )
+                await asyncio.sleep(backoff)
+                continue
         await asyncio.sleep(max(.5, interval))
 
 
@@ -975,6 +1367,7 @@ def create_app(
         # turn that started it ended) has no live "turn"/websocket to
         # answer through -- broadcast to every currently connected tablet,
         # same as the existing autonomous-behavior dispatch already does.
+        logger.info("skill_speak broadcasting text=%r to %d session(s)", text, registry.count())
         for session in registry.sessions():
             try:
                 await session.websocket.send_json(
@@ -1027,6 +1420,102 @@ def create_app(
     @application.get("/health")
     async def health() -> dict[str, Any]:
         return {"status": "ok", "devices": registry.count(), "llm": settings.llm_provider}
+
+    @application.get("/idle/doodle_subject")
+    async def doodle_subject() -> dict[str, Any]:
+        """A cheap (no LLM call) pick of something for the tablet's
+        "doodling" idle vignette to actually draw, instead of a random
+        squiggle -- one round trip, no tokens spent, picked from a small
+        curated set of subjects the tablet already knows how to render
+        (see idle_doodle_overlay.dart's `_subjectDrawings`). Prefers
+        whatever he last "read" about (see /reading/learn), one-shot --
+        so a reading session sets up what he tries to draw next, then
+        falls back to picking at random again."""
+        read_subject = bridge.agent.needs_engine.consume_last_read_subject()
+        bridge.agent.needs_engine.save()
+        return {"subject": read_subject or random.choice(_DOODLE_SUBJECTS)}
+
+    @application.post("/reading/learn")
+    async def reading_learn() -> dict[str, Any]:
+        """Called once per "reading" idle session (see
+        idle_reading_overlay.dart) -- no LLM call, picks one lesson from
+        the small curated _READING_LESSONS list, nudges the matching
+        PersonalityTraits field a tiny amount (many sessions to add up to
+        anything noticeable, on purpose), and remembers its paired
+        drawable subject for the next doodle session."""
+        lesson = random.choice(_READING_LESSONS)
+        traits = bridge.agent.personality.traits
+        current = getattr(traits, lesson["trait"])
+        setattr(traits, lesson["trait"], _clamp01(current + lesson["delta"]))
+        bridge.agent.personality.save()
+        bridge.agent.needs_engine.set_last_read_subject(lesson["subject"])
+        bridge.agent.needs_engine.set_last_read_topic(lesson["topic"])
+        bridge.agent.needs_engine.save()
+        return {"topic": lesson["topic"], "trait": lesson["trait"]}
+
+    @application.get("/idle/game_skill")
+    async def game_skill() -> dict[str, Any]:
+        """How much less random chess/checkers moves should be right now
+        -- fetched once per match by idle_chess_overlay.dart/
+        idle_checkers_overlay.dart to bias move selection."""
+        return {"skill": bridge.agent.needs_engine.state.game_skill}
+
+    @application.post("/idle/game_result")
+    async def game_result() -> dict[str, Any]:
+        """Called when a chess/checkers match concludes (a "loss", in the
+        vignette's simulated sense) -- nudges game_skill up a small,
+        slow amount. Not a real chess engine; just "prefers captures,
+        avoids obvious blunders" a bit more often as this rises."""
+        needs = bridge.agent.needs_engine.record_game_result()
+        bridge.agent.needs_engine.save()
+        return {"skill": needs.game_skill}
+
+    @application.get("/feed", response_class=HTMLResponse)
+    async def feed_page() -> str:
+        """A tiny mobile-first page, on the same LAN as the robot -- drag
+        a food up to feed Bob, no app install, no cloud dependency (see
+        the plan doc's part D for why this isn't an Artifact: it needs to
+        reach the robot's own websocket sessions directly). The tray shows
+        the same reference artwork the tablet uses (via GET /feed/img/*)
+        instead of generic emoji, generated from _FEED_FOODS so the two
+        never drift apart."""
+        tray = "\n    ".join(
+            f'<div class="food" data-food="{key}">'
+            f'<div class="food-card"><img src="/feed/img/{key}" alt="{label}"></div>'
+            f'<span>{label}</span></div>'
+            for key, label in _FEED_FOODS
+        )
+        return _FEED_PAGE_HTML.replace("__FOOD_TRAY__", tray)
+
+    @application.get("/feed/img/{food}")
+    async def feed_food_image(food: str) -> FileResponse:
+        """Serves the same PNGs bundled into the tablet app
+        (tablet_app/assets/images/food/<key>.png) -- `food` is checked
+        against the closed _FEED_FOODS list, never used as a raw path, so
+        this can't be turned into an arbitrary-file read."""
+        valid_keys = {key for key, _ in _FEED_FOODS}
+        if food not in valid_keys:
+            raise HTTPException(status_code=404, detail="unknown food")
+        path = _FEED_FOOD_ASSETS_DIR / f"{food}.png"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="image not found")
+        return FileResponse(path, media_type="image/png")
+
+    @application.post("/feed")
+    async def feed_robot(request: FeedRequest) -> dict[str, Any]:
+        needs = bridge.agent.needs_engine.feed()
+        bridge.agent.needs_engine.save()
+        # A small, genuine mood lift -- being fed is a nice thing to
+        # happen, not just a number going down.
+        bridge.agent.emotional_engine.apply_event(EmotionEvent.COMPLIMENT_RECEIVED)
+        bridge.agent.emotional_engine.save()
+        sent = 0
+        for session in registry.sessions():
+            await session.websocket.send_json(
+                outgoing_message("feed_animation", session.device_id, {"food": request.food})
+            )
+            sent += 1
+        return {"hunger": needs.hunger, "sent_to_devices": sent}
 
     @application.post("/debug/events")
     async def inject_debug_event(request: DebugEventRequest) -> dict[str, Any]:
@@ -1174,6 +1663,13 @@ def create_app(
                         session.playback_done.set()
                 elif message.type == "device_status":
                     logger.debug("Status from %s: %s", device_id, message.payload)
+                elif message.type == "idle_activity_report":
+                    session = registry.get(device_id)
+                    if session is not None:
+                        kind = message.payload.get("kind")
+                        session.active_idle_kind = kind
+                        if kind is not None:
+                            session.last_idle_kind = kind
         except WebSocketDisconnect:
             pass
         finally:
