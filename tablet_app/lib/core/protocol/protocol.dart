@@ -227,4 +227,23 @@ class RobotMessageFactory {
       },
     );
   }
+
+  /// Which idle self-entertainment vignette (if any) is currently
+  /// showing -- lets the backend's cognition tick actually respond to
+  /// what's on screen (resting/coffee speeds up energy recovery, the
+  /// active cluster relieves boredom -- see api/server.py's
+  /// _ACTIVE_IDLE_KINDS/_RESTING_IDLE_KINDS) instead of the vignette
+  /// being purely cosmetic. [kind] is null when nothing's showing.
+  static RobotMessage idleActivityReport({
+    required String deviceId,
+    required String? kind,
+  }) {
+    return RobotMessage(
+      version: 1,
+      type: 'idle_activity_report',
+      deviceId: deviceId,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: {'kind': kind},
+    );
+  }
 }

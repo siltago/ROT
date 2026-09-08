@@ -45,7 +45,7 @@ class FakeAgent:
     def __init__(self) -> None:
         self.turns: list[str] = []
 
-    async def process_turn(self, text: str) -> TurnResult:
+    async def process_turn(self, text: str, *args, **kwargs) -> TurnResult:
         self.turns.append(text)
         return TurnResult(
             reply="ok",

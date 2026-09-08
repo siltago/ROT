@@ -20,3 +20,4 @@ data/people/*.json
 !data/people/.gitkeep
 server*.log
 server.runtime.*.log
+.pytest_tmp/

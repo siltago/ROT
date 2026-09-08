@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from integrations.music.lyrics import LrclibProvider
 from integrations.music.models import PlaybackState, VisualCue
 from integrations.music.spotify import SpotifyProvider
@@ -19,18 +20,39 @@ class MusicExperienceService:
         # playing on the user's own Spotify session (phone, PC...) any time
         # it's on, which is not something the user asked the robot to show.
         self.presenting = False
-        # Track ids already offered ("vi que você está ouvindo em <device>,
-        # quer que eu abra aqui?") this run -- asked once per track, whether
-        # accepted or declined, so the sync loop never nags on every poll.
-        self._offered_tracks: set[str] = set()
+        # Whether the last poll tick saw ambient playback (elsewhere)
+        # still going, and when the "quer que eu abra o player aqui?"
+        # offer was last made -- together these define one "listening
+        # session": ask once per session (not once per track, so a new
+        # song starting mid-session never re-prompts), and only ask again
+        # either after a genuine gap in playback or once real time has
+        # passed. See `should_offer`.
+        self._ambient_playing = False
+        self._last_offer_at: datetime | None = None
+        self._re_offer_after = timedelta(hours=2)
 
-    def should_offer(self, track_id: str) -> bool:
-        """True the first time this track is seen playing elsewhere; marks
-        it offered immediately so concurrent/rapid poll ticks can't both
-        see "not yet offered" and each trigger their own prompt."""
-        if not track_id or track_id in self._offered_tracks:
+    def should_offer(self, is_playing: bool) -> bool:
+        """Whether to prompt to open the player right now for playback
+        happening elsewhere. Call once per poll tick with whether ambient
+        playback is currently active, regardless of whether an offer ends
+        up being shown -- that's what lets a real gap in playback (the
+        source pausing, or switching off) be told apart from just the
+        track changing, which is the whole point: a new song within an
+        already-answered session should stay silent.
+        """
+        now = datetime.now(timezone.utc)
+        if not is_playing:
+            self._ambient_playing = False
             return False
-        self._offered_tracks.add(track_id)
+        if self._ambient_playing:
+            stale = (
+                self._last_offer_at is None
+                or now - self._last_offer_at >= self._re_offer_after
+            )
+            if not stale:
+                return False
+        self._ambient_playing = True
+        self._last_offer_at = now
         return True
 
     async def play(self, query: str) -> PlaybackState | None:

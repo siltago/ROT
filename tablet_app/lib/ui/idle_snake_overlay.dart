@@ -16,11 +16,18 @@ class IdleSnakeOverlay extends StatefulWidget {
     super.key,
     required this.mood,
     required this.onDismiss,
+    required this.onFinished,
     this.maxDuration = const Duration(seconds: 20),
   });
 
   final RobotMood mood;
+  // User interrupted (spoke, called the robot) -- clears the overlay
+  // entirely.
   final VoidCallback onDismiss;
+  // The vignette ran its natural course (here, just maxDuration -- snake
+  // never really "loses") -- the caller should start a fresh idle
+  // activity instead of leaving the face blank.
+  final VoidCallback onFinished;
   final Duration maxDuration;
 
   @override
@@ -50,7 +57,7 @@ class _IdleSnakeOverlayState extends State<IdleSnakeOverlay> {
     _resetGame();
     _tickTimer =
         Timer.periodic(const Duration(milliseconds: 230), (_) => _tick());
-    _dismissTimer = Timer(widget.maxDuration, widget.onDismiss);
+    _dismissTimer = Timer(widget.maxDuration, widget.onFinished);
   }
 
   void _resetGame() {

@@ -34,6 +34,9 @@ def build_style_guide(
     personality: PersonalityTraits,
     emotion: EmotionalState,
     person: PersonProfile | None,
+    hunger: float = 0.0,
+    idle_seconds: float = 0.0,
+    current_activity: str | None = None,
 ) -> StyleGuide:
     # Tone driven mostly by emotional valence + irritation.
     if emotion.irritation > 0.6:
@@ -68,6 +71,24 @@ def build_style_guide(
         notes.append("fale como alguém próximo, sem virar servil ou invasivo")
     if emotion.energy < 0.3:
         notes.append("energia baixa: responda de forma ainda mais curta e suave")
+    if hunger > 0.75:
+        notes.append("está com fome de verdade: pode reclamar ou pedir comida, mesmo sem vir ao caso")
+    if emotion.energy < 0.15:
+        notes.append(
+            "está com muito sono, quase dormindo: se o pedido for só "
+            "conversa (nada pra executar de fato), pode resmungar e "
+            "recusar gentilmente -- algo como 'aah me deixa dormir'; se "
+            "for um pedido de ação de verdade, cumpra normalmente, só "
+            "comentando que está com sono"
+        )
+    if hunger > 0.6 and idle_seconds > 900:
+        notes.append("tédio e fome ao mesmo tempo: tom mais seco e impaciente")
+    if current_activity:
+        notes.append(
+            f'agora mesmo, antes dessa mensagem chegar, estava {current_activity} -- '
+            'se perguntarem o que você está fazendo (ou o que está lendo/jogando), '
+            'responda com isso, naturalmente, sem soar como uma lista de status'
+        )
 
     return StyleGuide(
         tone=tone,

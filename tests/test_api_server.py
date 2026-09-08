@@ -16,7 +16,7 @@ class _FakeEmotionalEngine:
 class _FakeAgent:
     emotional_engine = _FakeEmotionalEngine()
 
-    async def process_turn(self, text: str) -> TurnResult:
+    async def process_turn(self, text: str, *args, **kwargs) -> TurnResult:
         return TurnResult(
             reply=f"Resposta para: {text}",
             decision=Decision(type=IntentType.DIALOGUE, confidence=0.8, raw_text=text),
@@ -24,7 +24,7 @@ class _FakeAgent:
 
 
 class _FakeTimeAgent(_FakeAgent):
-    async def process_turn(self, text: str) -> TurnResult:
+    async def process_turn(self, text: str, *args, **kwargs) -> TurnResult:
         return TurnResult(
             reply="Agora são 19:27.",
             decision=Decision(type=IntentType.ACTION, confidence=1, raw_text=text),

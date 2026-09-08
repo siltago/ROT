@@ -39,3 +39,4 @@ PermissionPolicy e ActionExecutor. O provider só executa uma ação já validad
 O funcionamento totalmente offline depende da integração do aparelho. Matter,
 Zigbee, ESPHome e integrações LAN podem ser locais; alguns fabricantes ainda
 dependem da nuvem própria, mesmo sem Google Cloud.
+

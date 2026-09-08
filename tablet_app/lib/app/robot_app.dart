@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
@@ -20,7 +21,17 @@ import '../robot/robot_display_state.dart';
 import '../robot/robot_mood.dart';
 import '../robot/presentation_scene.dart';
 import '../robot/wake_state.dart';
+import '../ui/attributes_panel.dart';
 import '../ui/debug_panel.dart';
+import '../ui/idle_bored_overlay.dart';
+import '../ui/idle_checkers_overlay.dart';
+import '../ui/idle_chess_overlay.dart';
+import '../ui/idle_coffee_overlay.dart';
+import '../ui/idle_doodle_overlay.dart';
+import '../ui/idle_feed_overlay.dart';
+import '../ui/idle_humming_overlay.dart';
+import '../ui/idle_reading_overlay.dart';
+import '../ui/idle_resting_overlay.dart';
 import '../ui/idle_snake_overlay.dart';
 import '../ui/presentation_scene_widget.dart';
 import '../ui/robot_face_widget.dart';
@@ -72,6 +83,15 @@ class _RobotAppState extends State<RobotApp> {
   String _expression = 'neutral';
   RobotMood _mood = const RobotMood();
   String _brainUrl = AppConfig.defaultBrainUrl;
+  // Same host/port as the websocket connection, but as a plain http(s)
+  // base -- used for the odd one-off REST call (e.g. the doodle
+  // overlay's subject pick) that doesn't belong on the websocket
+  // protocol. Derived, not separately configured, so it never drifts out
+  // of sync with whatever server URL Settings points at.
+  String get _httpBaseUrl => _brainUrl
+      .replaceFirst('ws://', 'http://')
+      .replaceFirst('wss://', 'https://')
+      .replaceFirst(RegExp(r'/ws/device/?$'), '');
   bool _debugVisible = false;
   bool _connected = false;
   bool _speechDetected = false;
@@ -99,9 +119,76 @@ class _RobotAppState extends State<RobotApp> {
   Duration? _partialLatency;
   Duration? _finalLatency;
   bool _idleOverlayVisible = false;
+  // Which self-entertainment vignette is currently showing. Picked
+  // randomly each time an idle animation is triggered (see
+  // _triggerIdleAnimation); null only before the first one ever runs.
+  String? _idleActivityKind;
+  static const _idleActivityKinds = [
+    'snake', 'checkers', 'chess', 'reading',
+    'resting', 'bored', 'coffee', 'humming', 'doodle',
+  ];
+  // Rough expected duration (seconds) of each activity -- picking evenly
+  // at random would let a long game (checkers/chess, up to 2.5min) hog
+  // just as much total on-screen time as a 20s snake doodle, which reads
+  // as the games "dominating". Picks are weighted inversely by duration
+  // instead, so every activity gets roughly the same total screen time
+  // over a long stretch, not the same pick count. See _pickIdleActivity.
+  static const _idleActivityDurationSeconds = {
+    'snake': 20.0,
+    'reading': 30.0,
+    'checkers': 150.0,
+    'chess': 150.0,
+    'resting': 26.0,
+    'bored': 22.0,
+    'coffee': 25.0,
+    'humming': 22.0,
+    'doodle': 28.0,
+  };
+  // How restful each activity reads (0 = pretty active, 1 = pretty
+  // parked) -- used to bias picks by mood (see _pickIdleActivity): tired
+  // pulls toward the high end of this scale, curious/awake pulls toward
+  // the low end.
+  static const _idleActivityRestfulness = {
+    'resting': 1.0,
+    'coffee': 0.8,
+    'reading': 0.75,
+    'bored': 0.6,
+    'doodle': 0.4,
+    'humming': 0.35,
+    'snake': 0.15,
+    'checkers': 0.1,
+    'chess': 0.1,
+  };
+  final _idleActivityRandom = math.Random();
+  // The food currently being "eaten" (see IdleFeedOverlay) after a
+  // feed_animation message -- null when nothing's being fed right now.
+  // Independent of the idle-vignette system: can show up on top of
+  // anything else, and doesn't affect _idleOverlayVisible.
+  String? _feedFood;
+  int _feedKey = 0;
+  // Driven by IdleFeedOverlay's onMouthOpen while it's showing -- see
+  // RobotFaceWidget.mouthOpen.
+  double _mouthOpen = 0;
+  // True while ambient playback is happening elsewhere (someone's phone,
+  // PC...) and Bob isn't presenting his own player -- puts headphones on
+  // his face, "listening along". Set from `set_ambient_listening`
+  // messages (api/server.py's music sync loop); persistent, not an idle
+  // vignette, so it can be true regardless of what else is on screen.
+  bool _ambientListening = false;
+  static const _feedGaze = Offset(0.5, 0.82);
   PresentationScene? _activeScene;
   Timer? _sceneTimer;
   static const _idleOverlayGaze = Offset(0.15, 0.15);
+  // Looking down-center, toward each of these vignette's own bottom-center
+  // staged prop (the book, the coffee mug, the sketch pad) -- distinct
+  // from _idleOverlayGaze (top-left, where the two board games sit).
+  static const _readingGaze = Offset(0.5, 0.86);
+  static const _coffeeGaze = Offset(0.5, 0.82);
+  static const _doodleGaze = Offset(0.5, 0.84);
+  // A relaxed, unfocused middle distance -- not fixated on anything in
+  // particular, matching "resting"/"bored".
+  static const _restingGaze = Offset(0.5, 0.55);
+  static const _boredGaze = Offset(0.5, 0.45);
 
   @override
   void initState() {
@@ -212,7 +299,11 @@ class _RobotAppState extends State<RobotApp> {
     _subscriptions.add(_pcmMicrophone.speechEvents.listen((event) {
       if (!_pcmLive) return;
       if (event == SpeechEvent.started) {
-        _dismissIdleOverlay();
+        // Not dismissing the idle overlay here on purpose -- this is raw
+        // local voice-activity detection, which fires on any ambient
+        // speech/noise, not specifically on someone calling the robot.
+        // The overlay is dismissed once the backend actually confirms the
+        // wake word (see the 'wake_state' handler above).
         _pcmSpeechStartedAt = DateTime.now();
         _audioStreamer.start();
         for (final frame in _preRoll.drain()) {
@@ -388,6 +479,13 @@ class _RobotAppState extends State<RobotApp> {
       case 'play_idle_animation':
         _triggerIdleAnimation(kind: message.payload?['kind'] as String?);
         return;
+      case 'feed_animation':
+        _triggerFeedAnimation(message.payload?['food'] as String? ?? '🍎');
+        return;
+      case 'set_ambient_listening':
+        final listening = message.payload?['listening'] == true;
+        if (mounted) setState(() => _ambientListening = listening);
+        return;
       case 'wake_state':
         final awake = message.payload?['awake'] == true;
         _logger.i(
@@ -396,6 +494,10 @@ class _RobotAppState extends State<RobotApp> {
           setState(
               () => _wakeState = awake ? WakeState.active : WakeState.standby);
         }
+        // Only a confirmed wake word (the backend telling us so, here --
+        // not just local mic/VAD activity, which fires on any ambient
+        // noise or unrelated speech) should interrupt an idle vignette.
+        if (awake) _dismissIdleOverlay();
         return;
       case 'ping':
         _connection.sendMessage(
@@ -534,22 +636,140 @@ class _RobotAppState extends State<RobotApp> {
 
   /// The brain only ever decides *when* the robot entertains itself; *what*
   /// it does is picked locally so the protocol stays a single bare message
-  /// and new idle activities can be added here without touching the backend.
-  ///
-  /// Used to randomly alternate with a whistle tone -- removed: it played
-  /// even while music was playing (there's no way to duck/cancel it once
-  /// started) and, on this hardware's synth, read as more of a siren than
-  /// a whistle. The snake overlay alone is a safer default than picking a
-  /// replacement sound blind.
+  /// and new idle activities can be added here without touching the
+  /// backend. [kind] is an optional debug-only override (one of
+  /// _idleActivityKinds) sent by /debug/idle_animation to force a specific
+  /// one during manual testing -- production ticks never set it, so the
+  /// pick stays random as designed.
   void _triggerIdleAnimation({String? kind}) {
     if (!mounted || _idleOverlayVisible) return;
-    setState(() => _idleOverlayVisible = true);
+    setState(() {
+      _idleOverlayVisible = true;
+      _idleActivityKind = _idleActivityKinds.contains(kind)
+          ? kind
+          : _pickIdleActivity();
+    });
+    _reportIdleActivity(_idleActivityKind);
   }
 
   void _dismissIdleOverlay() {
     if (_idleOverlayVisible && mounted) {
       setState(() => _idleOverlayVisible = false);
+      _reportIdleActivity(null);
     }
+  }
+
+  /// Tells the backend which idle vignette (if any) is showing right
+  /// now, so its cognition tick can actually respond to it (see
+  /// RobotMessageFactory.idleActivityReport) instead of it being purely
+  /// cosmetic.
+  void _reportIdleActivity(String? kind) {
+    _connection.sendMessage(
+      RobotMessageFactory.idleActivityReport(
+        deviceId: AppConfig.deviceId,
+        kind: kind,
+      ),
+    );
+  }
+
+  void _triggerFeedAnimation(String food) {
+    if (!mounted) return;
+    setState(() {
+      _feedFood = food;
+      _feedKey++;
+    });
+  }
+
+  /// Called when a vignette ends on its own (a simulated "win/loss", or
+  /// its own internal timer) rather than from a real interruption --
+  /// swaps in a different activity right away instead of leaving the
+  /// face blank, so it still reads as the robot doing something.
+  void _idleActivityFinished() {
+    if (!mounted || !_idleOverlayVisible) return;
+    setState(() {
+      _idleActivityKind = _pickIdleActivity(exclude: _idleActivityKind);
+    });
+    _reportIdleActivity(_idleActivityKind);
+  }
+
+  /// Weighted pick across [_idleActivityKinds]. The base weight is
+  /// inversely proportional to how long an activity typically runs
+  /// (_idleActivityDurationSeconds), so short and long activities end up
+  /// getting roughly the same total screen time instead of the same pick
+  /// count -- then scaled by [_moodFactor] so how tired/awake Bob
+  /// actually is nudges what he picks (tired leans restful, curious
+  /// leans active) instead of picking blind to his own state.
+  /// [exclude], when given, is left out so a chained pick (after one
+  /// vignette just finished) doesn't immediately repeat itself.
+  String _pickIdleActivity({String? exclude}) {
+    var candidates = _idleActivityKinds
+        .where((k) => k != exclude && _isEligible(k))
+        .toList();
+    // If gating leaves nothing (a real edge case: e.g. excluding the
+    // just-finished kind also happened to remove the only eligible one),
+    // fall back to every kind rather than crashing on an empty pool.
+    if (candidates.isEmpty) {
+      candidates = _idleActivityKinds.where((k) => k != exclude).toList();
+    }
+    final pool = candidates.isNotEmpty ? candidates : _idleActivityKinds;
+    final weights = [
+      for (final k in pool) (1 / _idleActivityDurationSeconds[k]!) * _moodFactor(k)
+    ];
+    final total = weights.reduce((a, b) => a + b);
+    var roll = _idleActivityRandom.nextDouble() * total;
+    for (var i = 0; i < pool.length; i++) {
+      roll -= weights[i];
+      if (roll <= 0) return pool[i];
+    }
+    return pool.last;
+  }
+
+  /// How much [kind] fits Bob's current mood, as a multiplier on its
+  /// base weight in [_pickIdleActivity]. Combines two signals already
+  /// live in `_mood` (fed continuously by `set_expression`): the more
+  /// tired he is, the more the pick leans toward restful activities
+  /// (weighted by each kind's own [_idleActivityRestfulness]); the more
+  /// curious/awake he is, the more it leans toward active ones.
+  /// A hard gate, not just a weight nudge: "resting"/"coffee" shouldn't
+  /// even be in the running unless Bob is actually somewhat tired, and
+  /// "bored" shouldn't be in the running unless he's actually been idle
+  /// a while -- picking them regardless (just less often) read as
+  /// arbitrary rather than attribute-driven. Everything else stays
+  /// always-eligible, weighted by mood as before.
+  bool _isEligible(String kind) {
+    final tiredness = 1 - _mood.energy;
+    switch (kind) {
+      case 'resting':
+      case 'coffee':
+        return tiredness > 0.3;
+      case 'bored':
+        return _mood.boredom > 0.15;
+      default:
+        return true;
+    }
+  }
+
+  double _moodFactor(String kind) {
+    final restfulness = _idleActivityRestfulness[kind]!;
+    final tiredness = 1 - _mood.energy;
+    return 1 +
+        tiredness * restfulness * 2.2 +
+        _mood.curiosity * (1 - restfulness) * 1.3;
+  }
+
+  /// How long a restful activity (reading/resting/bored/coffee) should
+  /// actually run for, given [kind] and how tired Bob currently is.
+  /// These four are all short by design (~20-30s each, so no single one
+  /// hogs screen time -- see _idleActivityDurationSeconds), but that
+  /// also means being tired biases toward the whole short-restful
+  /// cluster at once, which without this would just look like rapid,
+  /// restless cycling between four different "calm" vignettes instead
+  /// of him actually settling down for a stretch. Stretches the base
+  /// duration up to ~3x at full tiredness; unaffected when well-rested.
+  Duration _restfulDuration(String kind) {
+    final base = _idleActivityDurationSeconds[kind]!;
+    final tiredness = 1 - _mood.energy;
+    return Duration(seconds: (base * (1 + tiredness * 2)).round());
   }
 
   void _showScene(PresentationScene scene) {
@@ -609,10 +829,28 @@ class _RobotAppState extends State<RobotApp> {
                             state: _robotState,
                             microphoneLevel: _microphoneLevel,
                             speechDetected: _speechDetected,
-                            trackedFace: _idleOverlayVisible
-                                ? _idleOverlayGaze
-                                : _trackedFace,
-                            isPlaying: _idleOverlayVisible,
+                            trackedFace: _feedFood != null
+                                ? _feedGaze
+                                : _idleOverlayVisible
+                                    ? (switch (_idleActivityKind) {
+                                        'reading' => _readingGaze,
+                                        'coffee' => _coffeeGaze,
+                                        'doodle' => _doodleGaze,
+                                        'resting' => _restingGaze,
+                                        'bored' => _boredGaze,
+                                        _ => _idleOverlayGaze,
+                                      })
+                                    : _trackedFace,
+                            isPlaying:
+                                _idleOverlayVisible && _idleActivityKind == 'snake',
+                            readingGlasses: _idleOverlayVisible &&
+                                _idleActivityKind == 'reading',
+                            restingEyes: _idleOverlayVisible &&
+                                _idleActivityKind == 'resting',
+                            headphones: _ambientListening ||
+                                (_idleOverlayVisible &&
+                                    _idleActivityKind == 'humming'),
+                            mouthOpen: _mouthOpen,
                             hueOverride:
                                 _wakeState == WakeState.standby ? 205.0 : 135.0,
                           )
@@ -626,9 +864,73 @@ class _RobotAppState extends State<RobotApp> {
               ),
               if (_idleOverlayVisible && _activeScene == null)
                 Positioned.fill(
-                  child: IdleSnakeOverlay(
-                    mood: _mood,
-                    onDismiss: _dismissIdleOverlay,
+                  child: switch (_idleActivityKind) {
+                    'checkers' => IdleCheckersOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        httpBaseUrl: _httpBaseUrl),
+                    'chess' => IdleChessOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        httpBaseUrl: _httpBaseUrl),
+                    'reading' => IdleReadingOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        maxDuration: _restfulDuration('reading'),
+                        httpBaseUrl: _httpBaseUrl),
+                    'resting' => IdleRestingOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        maxDuration: _restfulDuration('resting')),
+                    'bored' => IdleBoredOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        maxDuration: _restfulDuration('bored')),
+                    'coffee' => IdleCoffeeOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        maxDuration: _restfulDuration('coffee')),
+                    'humming' => IdleHummingOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished),
+                    'doodle' => IdleDoodleOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished,
+                        httpBaseUrl: _httpBaseUrl),
+                    _ => IdleSnakeOverlay(
+                        key: ValueKey(_idleActivityKind),
+                        mood: _mood,
+                        onDismiss: _dismissIdleOverlay,
+                        onFinished: _idleActivityFinished),
+                  },
+                ),
+              if (_feedFood != null)
+                Positioned.fill(
+                  child: IdleFeedOverlay(
+                    key: ValueKey('feed-$_feedKey'),
+                    food: _feedFood!,
+                    onDone: () {
+                      if (mounted) setState(() => _feedFood = null);
+                    },
+                    onMouthOpen: (v) {
+                      if (mounted) setState(() => _mouthOpen = v);
+                    },
                   ),
                 ),
               // Always-reachable settings entry point -- the gear button
@@ -649,6 +951,11 @@ class _RobotAppState extends State<RobotApp> {
                   left: 16,
                   bottom: 16,
                   child: _StatusPill(connected: _connected),
+                ),
+                Positioned(
+                  top: 52,
+                  right: 8,
+                  child: AttributesPanel(mood: _mood),
                 ),
               ],
               if (_activeScene == null || _debugVisible)

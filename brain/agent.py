@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable
 
 from actions.executor import ActionExecutor
@@ -25,8 +26,10 @@ from brain.skill_learning import SkillLearningState, SkillTeacher, SkillTeachRes
 from brain.world_state import WorldState
 from emotions.engine import EmotionalEngine
 from emotions.events import EmotionEvent
+from emotions.needs import NeedsEngine, NeedsStore
 from memory.long_term import LongTermMemory, MemoryKind, MemoryRecord, score_candidate
 from memory.people import PeopleDirectory, PersonProfile
+from memory.repository import InMemoryRepository
 from memory.short_term import ShortTermMemory
 from perception.speech.yes_no import classify_yes_no
 from personality.personality import Personality
@@ -65,6 +68,7 @@ class RobotAgent:
         response_engine: ResponseEngine,
         personality: Personality,
         emotional_engine: EmotionalEngine,
+        needs_engine: NeedsEngine | None = None,
         people: PeopleDirectory,
         long_term: LongTermMemory,
         short_term: ShortTermMemory,
@@ -86,6 +90,10 @@ class RobotAgent:
         self.response_engine = response_engine
         self.personality = personality
         self.emotional_engine = emotional_engine
+        # Falls back to a non-persistent store rather than requiring every
+        # caller (tests included) to wire one up -- production always
+        # passes a real one (see app/main.py's build_needs_repository).
+        self.needs_engine = needs_engine or NeedsEngine(NeedsStore(InMemoryRepository()))
         self.people = people
         self.long_term = long_term
         self.short_term = short_term
@@ -101,8 +109,16 @@ class RobotAgent:
             personality=self.personality.traits,
         )
 
-    async def process_turn(self, text: str, person_id: str | None = None) -> TurnResult:
+    async def process_turn(
+        self, text: str, person_id: str | None = None, *, current_activity: str | None = None,
+    ) -> TurnResult:
         start = time.monotonic()
+        # Captured *before* mark_user_turn resets last_interaction_at to
+        # now -- this is "how bored was I right up until this message
+        # interrupted me", which is what should color this reply's tone,
+        # not "how long since the message that's currently being handled".
+        last_interaction = self.world_state.activity.last_interaction_at or self.world_state.activity.active_since
+        idle_seconds_before_turn = (datetime.now(timezone.utc) - last_interaction).total_seconds()
         self.world_state.mark_user_turn(person_id)
         self.event_bus.publish(EventType.USER_SPOKE, {"person_id": person_id or "unknown", "text": text})
 
@@ -162,6 +178,9 @@ class RobotAgent:
             person=person,
             personality=self.personality.traits,
             emotion=self.emotional_engine.state,
+            hunger=self.needs_engine.state.hunger,
+            idle_seconds=idle_seconds_before_turn,
+            current_activity=current_activity,
         )
 
         planning_started = time.monotonic()

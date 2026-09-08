@@ -20,6 +20,10 @@ class RobotFaceWidget extends StatefulWidget {
     required this.speechDetected,
     required this.trackedFace,
     this.isPlaying = false,
+    this.readingGlasses = false,
+    this.restingEyes = false,
+    this.headphones = false,
+    this.mouthOpen = 0.0,
     this.hueOverride,
   });
 
@@ -33,6 +37,26 @@ class RobotFaceWidget extends StatefulWidget {
   /// True while an idle self-entertainment animation is showing -- draws a
   /// small wiggling joystick under the eyes, echoing "I'm playing/focused".
   final bool isPlaying;
+
+  /// True while the "reading" idle activity is showing -- draws a pair of
+  /// reading glasses over the eyes, sized/positioned off the same
+  /// measurements the eyes themselves use so they track any eye movement.
+  final bool readingGlasses;
+
+  /// True while the "resting" idle activity is showing -- squints the
+  /// eyes to a sleepy half-open height instead of drawing anything extra.
+  final bool restingEyes;
+
+  /// True while the "humming" idle activity is showing -- draws a
+  /// headphone band and ear cups over the head, same sizing approach as
+  /// [readingGlasses].
+  final bool headphones;
+
+  /// 0 (closed, nothing drawn) to 1 (fully open) -- driven by the feed
+  /// animation (see robot_app.dart's IdleFeedOverlay) while a piece of
+  /// food dropped on /feed is being "eaten", so that actually reads as
+  /// eating rather than just a food icon disappearing near the face.
+  final double mouthOpen;
 
   /// When set, replaces the mood-driven eye color with this hue (0-360) at
   /// a fixed, pale saturation/lightness -- used to show wake-word state
@@ -175,7 +199,16 @@ class _RobotFaceWidgetState extends State<RobotFaceWidget>
                     final blinkPulse =
                         math.sin(math.pi * _blink.value.clamp(0.0, 1.0));
                     final idleT = _idleDrift.value;
-                    final breathing = 1 + math.sin(idleT * 2 * math.pi) * 0.012;
+                    // Resting slows the breathing cycle down; the eyes
+                    // themselves switch to a drawn closed-lid curve (see
+                    // _ClosedEyePainter, used by _Eye when `closed` is
+                    // true) instead of the usual capsule shrunk down --
+                    // a flattened capsule reads as a small circle or a
+                    // flat bar, never an actually curved closed eye.
+                    final breathing = widget.restingEyes
+                        ? 1 + math.sin(idleT * 2 * math.pi * 0.4) * 0.02
+                        : 1 + math.sin(idleT * 2 * math.pi) * 0.012;
+                    final restingWidthScale = widget.restingEyes ? 1.15 : 1.0;
 
                     final leftLook = _computeEyeLook(
                       isLeft: true,
@@ -183,7 +216,7 @@ class _RobotFaceWidgetState extends State<RobotFaceWidget>
                       state: widget.state,
                       blink: blinkPulse,
                       speakPulse: pulse,
-                      baseWidth: baseEyeWidth,
+                      baseWidth: baseEyeWidth * restingWidthScale,
                       baseHeight: baseEyeHeight * breathing,
                       hueOverride: widget.hueOverride,
                     );
@@ -193,7 +226,7 @@ class _RobotFaceWidgetState extends State<RobotFaceWidget>
                       state: widget.state,
                       blink: blinkPulse,
                       speakPulse: pulse,
-                      baseWidth: baseEyeWidth,
+                      baseWidth: baseEyeWidth * restingWidthScale,
                       baseHeight: baseEyeHeight * breathing,
                       hueOverride: widget.hueOverride,
                     );
@@ -214,12 +247,123 @@ class _RobotFaceWidgetState extends State<RobotFaceWidget>
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
+                          Stack(
+                            alignment: Alignment.center,
+                            // The Stack's own size now comes solely from
+                            // the eyes Row (the accessory images below are
+                            // Positioned.fill, exempt from sizing it) --
+                            // but that means it's a small box, and an
+                            // accessory image bigger than that box would
+                            // get clipped to it under the default
+                            // Clip.hardEdge. Clip.none lets them render at
+                            // their real (larger) size, centered on it.
+                            clipBehavior: Clip.none,
                             children: [
-                              _Eye(look: leftLook),
-                              SizedBox(width: gap),
-                              _Eye(look: rightLook),
+                              // Paint order (a Stack paints later
+                              // children on top of earlier ones):
+                              // headphones behind the eyes (the band
+                              // arcs over the head, cups beside it --
+                              // it reads as worn under/around the face),
+                              // then the eyes, then glasses in front of
+                              // the eyes (they sit on the nose, in front
+                              // of the face).
+                              if (widget.headphones)
+                                Positioned.fill(
+                                  child: IgnorePointer(
+                                    child: OverflowBox(
+                                      maxWidth: double.infinity,
+                                      maxHeight: double.infinity,
+                                      // The exact reference headphones
+                                      // art, not a drawn approximation --
+                                      // same sizing approach as
+                                      // glasses.png, just much wider so
+                                      // the ear cups clear well past the
+                                      // eye row's edges instead of
+                                      // landing on top of the eyes.
+                                      child: Transform.translate(
+                                        // Negative (up), not positive --
+                                        // the cups need to land level
+                                        // with the eyes, not below them.
+                                        offset: Offset(0, -baseEyeHeight * 0.35),
+                                        child: Image.asset(
+                                          'assets/images/headphones.png',
+                                          width: (baseEyeWidth * 2 + gap) * 2.0,
+                                          fit: BoxFit.contain,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  _Eye(look: leftLook, closed: widget.restingEyes),
+                                  SizedBox(width: gap),
+                                  _Eye(look: rightLook, closed: widget.restingEyes),
+                                ],
+                              ),
+                              if (widget.readingGlasses)
+                                // Positioned.fill + an inner OverflowBox
+                                // keeps this out of the Stack's own size
+                                // calculation entirely -- otherwise an
+                                // accessory image wider/taller than the
+                                // eye row (as headphones especially are)
+                                // inflates the Stack itself, which then
+                                // shoves the whole face down within the
+                                // Column below it. A plain non-Positioned
+                                // child would do exactly that. OverflowBox
+                                // (not Center) matters here too: Center
+                                // alone still caps the child's max size to
+                                // the tiny Positioned.fill box it's inside
+                                // -- exactly the "glasses shrank" bug this
+                                // replaced -- where OverflowBox actually
+                                // lets the child lay out at its own
+                                // requested (larger) size.
+                                Positioned.fill(
+                                  child: IgnorePointer(
+                                    child: OverflowBox(
+                                      maxWidth: double.infinity,
+                                      maxHeight: double.infinity,
+                                      // The exact reference glasses art,
+                                      // not a drawn approximation --
+                                      // sized off the same eye-row
+                                      // measurements so it still tracks
+                                      // the eyes, but wider than that row
+                                      // (glasses read wider than the eyes
+                                      // themselves) and nudged down
+                                      // toward the bottom of the eyes,
+                                      // like glasses slid part-way down
+                                      // the nose.
+                                      child: Transform.translate(
+                                        offset: Offset(0, baseEyeHeight * 0.36),
+                                        child: Image.asset(
+                                          'assets/images/glasses.png',
+                                          width: (baseEyeWidth * 2 + gap) * 1.55,
+                                          fit: BoxFit.contain,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              if (widget.mouthOpen > 0)
+                                Positioned.fill(
+                                  child: IgnorePointer(
+                                    child: OverflowBox(
+                                      maxWidth: double.infinity,
+                                      maxHeight: double.infinity,
+                                      child: Transform.translate(
+                                        offset: Offset(0, baseEyeHeight * 0.95),
+                                        child: CustomPaint(
+                                          size: Size(baseEyeWidth * 1.5, baseEyeHeight * 0.55),
+                                          painter: _MouthPainter(
+                                            openness: widget.mouthOpen,
+                                            color: leftLook.color,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
                             ],
                           ),
                           const SizedBox(height: 28),
@@ -304,7 +448,13 @@ _EyeLook _computeEyeLook({
   // height and nothing else, so the shape stays a rounded capsule -- never a
   // flat-cut "eyelid" -- all the way down to a thin rounded sliver.
   double openness = 1.0;
-  openness -= (1 - mood.energy) * 0.55; // tired -> heavier eyes
+  // Tired -> heavier eyes, all the time (not just during the special
+  // "resting" idle vignette) -- pushed further than before (0.55 -> 0.65)
+  // so real exhaustion is visible on the main face, not just a subtle
+  // squint nobody notices, but not so far that ordinary moderate
+  // tiredness reads as fully asleep on a face that isn't even doing the
+  // "resting" vignette.
+  openness -= (1 - mood.energy) * 0.65;
   openness -= mood.irritation * 0.12; // irritation -> slight squint
   if (mood.valence > 0.5) {
     openness += (mood.valence - 0.5) * 0.18; // bright/happy -> a touch wider
@@ -380,14 +530,32 @@ Color _moodColor(RobotMood mood, RobotDisplayState state,
 }
 
 class _Eye extends StatelessWidget {
-  const _Eye({required this.look});
+  const _Eye({required this.look, this.closed = false});
 
   final _EyeLook look;
+
+  /// True for the "resting" idle activity -- draws a gently downward-
+  /// curved closed-lid line (see [_ClosedEyePainter]) instead of the
+  /// usual capsule. A capsule just squashed down on height reads as a
+  /// small circle or a flat bar, never an actually curved closed eye.
+  final bool closed;
 
   @override
   Widget build(BuildContext context) {
     final w = look.width;
     final h = look.height;
+
+    if (closed) {
+      return Transform.rotate(
+        angle: look.rotation,
+        child: SizedBox(
+          width: w,
+          height: math.max(h, w * 0.5),
+          child: CustomPaint(painter: _ClosedEyePainter(color: look.color)),
+        ),
+      );
+    }
+
     // Corner radius is capped by the shape's own smaller side, so the eye is
     // always a rounded capsule -- including while shrinking down to a thin
     // rounded sliver for a blink -- and the glow (same box) never drifts out
@@ -415,4 +583,81 @@ class _Eye extends StatelessWidget {
       ),
     );
   }
+}
+
+/// A thin line curving gently downward in the middle (like a shallow
+/// "⌣") -- a closed/sleepy eyelid, drawn as an actual curve rather than a
+/// flattened capsule.
+class _ClosedEyePainter extends CustomPainter {
+  _ClosedEyePainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final midY = size.height * 0.42;
+    final dip = w * 0.22;
+    final path = Path()
+      ..moveTo(w * 0.06, midY)
+      ..quadraticBezierTo(w * 0.5, midY + dip, w * 0.94, midY);
+    final strokeWidth = w * 0.09;
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color.withValues(alpha: 0.4)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth * 2.4
+        ..strokeCap = StrokeCap.round
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10),
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..strokeCap = StrokeCap.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _ClosedEyePainter oldDelegate) => oldDelegate.color != color;
+}
+
+/// A small rounded mouth that opens (a wide oval) and closes (a thin
+/// line) with [openness] -- driven by the feed animation's "chomp" beats
+/// so eating a dropped food actually reads as eating.
+class _MouthPainter extends CustomPainter {
+  _MouthPainter({required this.openness, required this.color});
+
+  final double openness;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final o = openness.clamp(0.0, 1.0);
+    final width = size.width * (0.55 + o * 0.15);
+    final height = size.height * (0.08 + o * 0.92);
+    final rect = Rect.fromCenter(
+      center: Offset(size.width / 2, size.height / 2),
+      width: width,
+      height: height,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, Radius.circular(height / 2)),
+      Paint()..color = const Color(0xFF06090F),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, Radius.circular(height / 2)),
+      Paint()
+        ..color = color.withValues(alpha: 0.55)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _MouthPainter oldDelegate) =>
+      oldDelegate.openness != openness || oldDelegate.color != color;
 }
