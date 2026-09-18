@@ -22,6 +22,11 @@ class TurnContext:
     style: StyleGuide
     recent_dialogue: str
     relevant_memories: list[MemoryRecord]
+    # Bob's persistent self-identity (who he is, his day-to-day focus,
+    # accumulated self-notes) -- see memory/identity.py. Injected into
+    # every system prompt regardless of who's talking, unlike
+    # relevant_memories which is per-person.
+    identity_text: str = ""
 
 
 class ContextBuilder:
@@ -37,10 +42,13 @@ class ContextBuilder:
         hunger: float = 0.0,
         idle_seconds: float = 0.0,
         current_activity: str | None = None,
+        identity_text: str = "",
+        device_status: str | None = None,
     ) -> TurnContext:
         style = build_style_guide(
             personality, emotion, person,
             hunger=hunger, idle_seconds=idle_seconds, current_activity=current_activity,
+            device_status=device_status,
         )
         memories = self.long_term.for_person(person.id) if person else []
         # Most important, then most recent -- "relevant" should mean more
@@ -53,4 +61,5 @@ class ContextBuilder:
             style=style,
             recent_dialogue=self.short_term.as_context_text(),
             relevant_memories=ranked[:4],
+            identity_text=identity_text,
         )

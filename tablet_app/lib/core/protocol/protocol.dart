@@ -234,6 +234,23 @@ class RobotMessageFactory {
   /// active cluster relieves boredom -- see api/server.py's
   /// _ACTIVE_IDLE_KINDS/_RESTING_IDLE_KINDS) instead of the vignette
   /// being purely cosmetic. [kind] is null when nothing's showing.
+  /// Tells the backend the tablet's current hardware state (volume and
+  /// brightness, 0..100) so Bob can answer questions about it and reason
+  /// about adjusting it -- sent on connect and after every device_control.
+  static RobotMessage deviceState({
+    required String deviceId,
+    required int volume,
+    required int brightness,
+  }) {
+    return RobotMessage(
+      version: 1,
+      type: 'device_state',
+      deviceId: deviceId,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: {'volume': volume, 'brightness': brightness},
+    );
+  }
+
   static RobotMessage idleActivityReport({
     required String deviceId,
     required String? kind,

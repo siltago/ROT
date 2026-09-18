@@ -16,17 +16,20 @@ from actions.executor import ActionExecutor
 from brain.action_router import LlmActionRouter
 from brain.context import ContextBuilder
 from brain.behaviors import BehaviorEngine, BehaviorProposal, InitiativeEngine
+from brain.choice import ChoiceState, PendingChoice, resolve as resolve_choice
 from brain.decision_engine import DecisionEngine
 from brain.cognition import CognitionEngine
 from brain.events import EventBus, EventType
-from brain.models import ActionRecord, BrainEvent, Decision, IntentType, Turn
+from brain.models import ActionRecord, ActionRequest, BrainEvent, Decision, IntentType, Turn
 from brain.planner import Planner
+from brain.reflection import SelfReflector
 from brain.response_engine import ResponseEngine
 from brain.skill_learning import SkillLearningState, SkillTeacher, SkillTeachResult, SkillTeachStatus
 from brain.world_state import WorldState
 from emotions.engine import EmotionalEngine
 from emotions.events import EmotionEvent
 from emotions.needs import NeedsEngine, NeedsStore
+from memory.identity import IdentityStore
 from memory.long_term import LongTermMemory, MemoryKind, MemoryRecord, score_candidate
 from memory.people import PeopleDirectory, PersonProfile
 from memory.repository import InMemoryRepository
@@ -69,6 +72,8 @@ class RobotAgent:
         personality: Personality,
         emotional_engine: EmotionalEngine,
         needs_engine: NeedsEngine | None = None,
+        identity_store: IdentityStore | None = None,
+        reflector: SelfReflector | None = None,
         people: PeopleDirectory,
         long_term: LongTermMemory,
         short_term: ShortTermMemory,
@@ -84,6 +89,10 @@ class RobotAgent:
         self.action_router = action_router
         self.skill_teacher = skill_teacher
         self.learning_state = SkillLearningState()
+        # The one "which do you mean?" question Bob may be waiting on (see
+        # brain/choice.py) -- lives on the agent, not a tablet session, so it
+        # works the same from the CLI.
+        self.choice_state = ChoiceState()
         self.planner = planner
         self.executor = executor
         self.context_builder = context_builder
@@ -94,6 +103,14 @@ class RobotAgent:
         # caller (tests included) to wire one up -- production always
         # passes a real one (see app/main.py's build_needs_repository).
         self.needs_engine = needs_engine or NeedsEngine(NeedsStore(InMemoryRepository()))
+        # Falls back the same way needs_engine does -- tests and any
+        # caller that doesn't care about identity still get a working
+        # agent, just with the hardcoded default self-concept instead of
+        # a persisted one.
+        self.identity_store = identity_store or IdentityStore(InMemoryRepository())
+        # Optional: learns from recent conversations on its own (see
+        # brain/reflection.py). None = no self-learning, e.g. in tests.
+        self.reflector = reflector
         self.people = people
         self.long_term = long_term
         self.short_term = short_term
@@ -111,6 +128,7 @@ class RobotAgent:
 
     async def process_turn(
         self, text: str, person_id: str | None = None, *, current_activity: str | None = None,
+        device_status: str | None = None,
     ) -> TurnResult:
         start = time.monotonic()
         # Captured *before* mark_user_turn resets last_interaction_at to
@@ -146,7 +164,32 @@ class RobotAgent:
         self.short_term.add(Turn(speaker="user", text=text, person_id=person_id))
 
         intent_started = time.monotonic()
-        decision = self.decision_engine.classify_follow_up(text, previous_robot_text)
+        decision = None
+        # If Bob just asked "which one?", this turn is the answer: a match
+        # re-runs the same action with the chosen value (skipping intent
+        # classification entirely); "cancela" drops it; anything unrelated
+        # drops the question and is handled as a normal new request.
+        if self.choice_state.active:
+            pending = self.choice_state.pending
+            answer = resolve_choice(pending, text)
+            self.choice_state.clear()
+            if answer.kind == "cancelled":
+                return self._learning_turn_result(text, "Beleza, deixei quieto.", person, person_id)
+            if answer.kind == "picked" and answer.option is not None:
+                if answer.remember and pending.remember_key:
+                    self.identity_store.state.preferences[pending.remember_key] = answer.option.value
+                    self.identity_store.save()
+                decision = Decision(
+                    type=IntentType.ACTION,
+                    confidence=1.0,
+                    raw_text=text,
+                    actions=[ActionRequest(
+                        name=pending.action,
+                        arguments={**pending.arguments, pending.param: answer.option.value},
+                    )],
+                )
+        if decision is None:
+            decision = self.decision_engine.classify_follow_up(text, previous_robot_text)
         # The regex rules only recognize phrasings someone already thought to
         # write a pattern for. Rather than growing that list forever, an
         # utterance that regex saw as plain dialogue (no clear command) gets
@@ -181,6 +224,8 @@ class RobotAgent:
             hunger=self.needs_engine.state.hunger,
             idle_seconds=idle_seconds_before_turn,
             current_activity=current_activity,
+            identity_text=self.identity_store.as_prompt_fragment(),
+            device_status=device_status,
         )
 
         planning_started = time.monotonic()
@@ -191,6 +236,12 @@ class RobotAgent:
         action_latency_ms = round((time.monotonic() - action_started) * 1000, 1)
 
         for record in action_records:
+            # An action that answered with a question instead of acting
+            # ("onde você quer ouvir?") leaves that question pending.
+            if record.outcome and not record.outcome.success:
+                asked = PendingChoice.from_outcome_data(record.name, record.arguments, record.outcome.data)
+                if asked is not None:
+                    self.choice_state.ask(asked)
             event = EmotionEvent.SUCCESSFUL_ACTION if record.outcome and record.outcome.success else EmotionEvent.FAILED_ACTION
             self.emotional_engine.apply_event(event)
             self.event_bus.publish(
@@ -213,6 +264,8 @@ class RobotAgent:
         reply = await self.response_engine.generate(decision, context, action_records)
         response_latency_ms = round((time.monotonic() - response_started) * 1000, 1)
         self.short_term.add(Turn(speaker="robot", text=reply, person_id=person_id))
+        if self.reflector is not None:
+            self.reflector.note_turn(self.short_term.as_context_text(10))
 
         latency_ms = round((time.monotonic() - start) * 1000, 1)
         behavior_event = (

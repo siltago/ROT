@@ -12,6 +12,7 @@ import '../core/permissions/permission_manager.dart';
 import '../core/protocol/protocol.dart';
 import '../devices/audio/audio_output_service.dart';
 import '../devices/camera/camera_service.dart';
+import '../devices/device_controls.dart';
 import '../devices/microphone/speech_recognition_service.dart';
 import '../devices/microphone/audio_pipeline.dart';
 import '../devices/microphone/audio_streamer.dart';
@@ -228,6 +229,7 @@ class _RobotAppState extends State<RobotApp> {
     _subscriptions.add(_connection.onStatus.listen((status) {
       if (!mounted) return;
       final connected = status == ConnectionStatus.connected;
+      if (connected) unawaited(_reportDeviceState());
       setState(() {
         _connected = connected;
         if (!connected) _robotState = RobotDisplayState.offline;
@@ -476,6 +478,10 @@ class _RobotAppState extends State<RobotApp> {
       case 'dismiss_scene':
         _dismissScene();
         return;
+      case 'device_control':
+        final payload = message.payload;
+        if (payload != null) unawaited(_applyDeviceControl(payload));
+        return;
       case 'play_idle_animation':
         _triggerIdleAnimation(kind: message.payload?['kind'] as String?);
         return;
@@ -650,6 +656,25 @@ class _RobotAppState extends State<RobotApp> {
           : _pickIdleActivity();
     });
     _reportIdleActivity(_idleActivityKind);
+  }
+
+  /// Applies a `device_control` from the backend (Bob adjusting the
+  /// tablet's own volume/brightness) and reports the resulting state.
+  Future<void> _applyDeviceControl(Map<String, dynamic> payload) async {
+    final state = await DeviceControls.apply(payload);
+    if (state != null) await _reportDeviceState(state);
+  }
+
+  Future<void> _reportDeviceState([Map<String, int>? known]) async {
+    final state = known ?? await DeviceControls.getState();
+    if (state == null) return;
+    _connection.sendMessage(
+      RobotMessageFactory.deviceState(
+        deviceId: AppConfig.deviceId,
+        volume: state['volume'] ?? 0,
+        brightness: state['brightness'] ?? 0,
+      ),
+    );
   }
 
   void _dismissIdleOverlay() {
