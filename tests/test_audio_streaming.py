@@ -266,3 +266,31 @@ async def test_new_stream_cancels_previous_and_disconnect_cleans_up() -> None:
     await coordinator.cancel("connection_lost")
     assert provider.session.cancelled is True
     assert coordinator.active is None
+
+
+async def test_wake_countdown_holds_while_user_speaks_or_turn_busy(monkeypatch) -> None:
+    # The wake window must be counted from when the conversation actually
+    # went quiet -- not from when it was armed. A long utterance or a long
+    # reply must never let the session expire mid-conversation.
+    import api.server as server
+
+    monkeypatch.setattr(server, "WAKE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(server, "WAKE_POLL_SECONDS", 0.05)
+    session = DeviceSession("tablet_test", _FakeWebSocket(), awake=True)  # type: ignore[arg-type]
+
+    session.user_speaking = True
+    server._arm_wake_timeout(session)
+    await asyncio.sleep(0.8)  # well past the timeout, but still mid-utterance
+    assert session.awake is True
+
+    session.user_speaking = False
+    session.turn_busy = 1
+    await asyncio.sleep(0.8)  # robot still processing/speaking
+    assert session.awake is True
+
+    session.turn_busy = 0
+    session.wake_quiet_since = __import__("time").monotonic()
+    await asyncio.sleep(0.15)
+    assert session.awake is True  # quiet, but not for the full window yet
+    await asyncio.sleep(0.5)
+    assert session.awake is False

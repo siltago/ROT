@@ -230,6 +230,15 @@ class FeedRequest(BaseModel):
     food: str = "apple"
 
 
+class IdentityNoteRequest(BaseModel):
+    note: str
+
+
+class IdentityKnowledgeRequest(BaseModel):
+    topic: str
+    text: str
+
+
 # Same 5 keys/images the tablet already bundles as
 # tablet_app/assets/images/food/<key>.png (see idle_feed_overlay.dart's
 # foodEmojiFallback, kept in sync by hand) -- reused here so the /feed
@@ -270,6 +279,15 @@ class DeviceSession:
     # become a real turn.
     awake: bool = False
     wake_timeout_task: "asyncio.Task[None] | None" = None
+    # The wake countdown only runs while the conversation is genuinely
+    # quiet: it is held (not just re-armed) for as long as the user is
+    # mid-utterance (`user_speaking`, an STT stream is open) or a turn is
+    # being processed/spoken (`turn_busy`, LLM + TTS + playback). It's
+    # `wake_quiet_since` -- the last moment either of those was true or the
+    # timer was re-armed -- that the 10s is counted from.
+    turn_busy: int = 0
+    user_speaking: bool = False
+    wake_quiet_since: float = 0.0
     # The client's own VAD sometimes splits "ei Bob" into two separate final
     # transcripts (e.g. "Ei," then "Bob" a beat later), neither of which
     # matches alone. Remembering the last non-matching standby transcript
@@ -313,6 +331,11 @@ class DeviceSession:
     # _current_activity_label; never read by the engagement/energy
     # calculations above, which should see the interruption as real.
     last_idle_kind: str | None = None
+    # Last hardware state the tablet reported (`device_state` message):
+    # {"volume": 0-100, "brightness": 0-100}. Empty until it reports.
+    # Feeds the "estado do tablet" style note so Bob can answer "quanto
+    # está o volume?" -- see TabletBrainBridge._device_status_label.
+    device_state: dict[str, int] = field(default_factory=dict)
 
 
 class DeviceRegistry:
@@ -533,6 +556,21 @@ class TabletBrainBridge:
         "doodle": "rabiscando um desenho",
     }
 
+    def _device_status_label(self, device_id: str) -> str | None:
+        """"volume 40%, brilho 70%" from the tablet's last `device_state`
+        report -- None until it has reported at least once."""
+        if self.registry is None:
+            return None
+        session = self.registry.get(device_id)
+        if session is None or not session.device_state:
+            return None
+        names = {"volume": "volume", "brightness": "brilho"}
+        return ", ".join(
+            f"{names[key]} {value}%"
+            for key, value in session.device_state.items()
+            if key in names
+        ) or None
+
     def _current_activity_label(self, device_id: str) -> str | None:
         """A human-readable answer to "o que você está fazendo?" -- from
         the idle vignette the device last reported showing (see
@@ -569,6 +607,21 @@ class TabletBrainBridge:
         return f"{base} até agora, mas parou pra te dar atenção"
 
     async def process_text(self, *, text: str, device_id: str, send: SendMessage, send_bytes: SendBytes) -> None:
+        # While a turn is being processed and spoken the wake countdown is
+        # held (see _arm_wake_timeout) -- otherwise a long answer could let
+        # the session expire mid-reply, the eye snapping back to standby
+        # while he's still talking.
+        session = self.registry.get(device_id) if self.registry is not None else None
+        if session is not None:
+            session.turn_busy += 1
+        try:
+            await self._process_text(text=text, device_id=device_id, send=send, send_bytes=send_bytes)
+        finally:
+            if session is not None:
+                session.turn_busy = max(0, session.turn_busy - 1)
+                session.wake_quiet_since = time.monotonic()
+
+    async def _process_text(self, *, text: str, device_id: str, send: SendMessage, send_bytes: SendBytes) -> None:
         cleaned = text.strip()
         if not cleaned:
             return
@@ -584,7 +637,11 @@ class TabletBrainBridge:
         try:
             current_activity = self._current_activity_label(device_id)
             async with self._turn_lock:
-                result = await self.agent.process_turn(cleaned, current_activity=current_activity)
+                result = await self.agent.process_turn(
+                    cleaned,
+                    current_activity=current_activity,
+                    device_status=self._device_status_label(device_id),
+                )
                 state = self.agent.emotional_engine.state
                 mood = state.mood_label()
             expression = expression_for_result(result, mood)
@@ -621,6 +678,18 @@ class TabletBrainBridge:
                 for record in result.action_records
             ):
                 await send(outgoing_message("play_idle_animation", device_id))
+            # device.set_*/device.change_* (actions/robot/device.py) have no
+            # side effect of their own either -- the tablet owns its
+            # volume/brightness, so a successful record's `data` is
+            # forwarded to it as a `device_control` message.
+            for record in result.action_records:
+                if (
+                    record.name.startswith("device.")
+                    and record.outcome
+                    and record.outcome.success
+                    and record.outcome.data.get("control")
+                ):
+                    await send(outgoing_message("device_control", device_id, dict(record.outcome.data)))
             # Wait for the tablet's own signal that it's actually done
             # playing the reply before returning -- otherwise the caller's
             # post-turn wake-timeout re-arm starts its countdown while the
@@ -679,6 +748,10 @@ class AudioStreamSession:
 # indefinitely -- is fixed at the source rather than papered over with a
 # bigger number.
 WAKE_TIMEOUT_SECONDS = 10.0
+# How often the wake countdown checks whether the conversation is still
+# active (see _arm_wake_timeout) -- fine-grained enough that the 10s of
+# silence is measured to well under a second.
+WAKE_POLL_SECONDS = 0.5
 
 # How long a non-matching standby transcript is remembered so it can be
 # joined with the next one (the client VAD sometimes splits "ei Bob" into
@@ -721,9 +794,22 @@ def _arm_wake_timeout(session: DeviceSession) -> None:
     """
     if session.wake_timeout_task is not None:
         session.wake_timeout_task.cancel()
+    session.wake_quiet_since = time.monotonic()
 
     async def _expire() -> None:
-        await asyncio.sleep(WAKE_TIMEOUT_SECONDS)
+        # Poll instead of one long sleep: a single sleep(10) armed before a
+        # long turn or a long utterance would expire mid-conversation (the
+        # eye snapping back to standby while the user is still talking or
+        # the robot is still answering). Counting only genuinely quiet time
+        # means the window starts once he's done speaking AND nobody is
+        # talking.
+        while True:
+            await asyncio.sleep(WAKE_POLL_SECONDS)
+            if session.turn_busy > 0 or session.user_speaking:
+                session.wake_quiet_since = time.monotonic()
+                continue
+            if time.monotonic() - session.wake_quiet_since >= WAKE_TIMEOUT_SECONDS:
+                break
         session.awake = False
         session.pending_music_offer = ""
         with suppress(Exception):
@@ -786,6 +872,7 @@ class AudioStreamCoordinator:
             }))
             return
         self.active = AudioStreamSession(stream_id=stream_id, stt=stt, awake_at_start=awake_at_start)
+        self._set_user_speaking(True)
         await self.send(outgoing_message("audio_stream_ready", self.device_id, {
             "stream_id": stream_id,
             "provider": self.provider.name,
@@ -848,11 +935,25 @@ class AudioStreamCoordinator:
                 "duplicate_chunks": active.duplicate_chunks,
             }))
             self.active = None
+            self._set_user_speaking(False)
+
+    def _set_user_speaking(self, speaking: bool) -> None:
+        """Mirrors "an utterance is being recorded/transcribed" onto the
+        session so the wake countdown holds while the user is mid-sentence
+        (see _arm_wake_timeout). Also restarts the quiet clock on the way
+        out, so the 10s is counted from when they stopped."""
+        session = self.registry.get(self.device_id)
+        if session is None:
+            return
+        session.user_speaking = speaking
+        if not speaking:
+            session.wake_quiet_since = time.monotonic()
 
     async def cancel(self, reason: str) -> None:
         if self.active is None:
             return
         active, self.active = self.active, None
+        self._set_user_speaking(False)
         await active.stt.cancel()
         # This path only ever fires for routine supersession/teardown --
         # a new utterance's stream replacing the previous one
@@ -1150,6 +1251,15 @@ async def _cognition_tick_loop(
                     outgoing_message("set_expression", session.device_id, payload)
                 )
 
+            # With no tablet connected there's nobody to receive whatever
+            # initiative gets selected -- and selecting one still spends its
+            # per-behavior cooldown and the hourly cap. Skipping here keeps
+            # those budgets intact for when a tablet actually connects,
+            # instead of Bob having "played" 4x to an empty room and then
+            # sitting bored (boredom 100%) for the next hour.
+            if not sessions:
+                continue
+
             result = await agent.cognition.process_event(
                 RobotEvent(type=EventType.IDLE_TIMEOUT, source="cognition_tick", data={"idle_seconds": idle_seconds})
             )
@@ -1166,6 +1276,13 @@ async def _cognition_tick_loop(
             raise
         except Exception:
             logger.exception("Cognition tick failed")
+
+
+def _is_actually_playing(payload: dict | None) -> bool:
+    """True only for a Spotify payload that is genuinely playing right now
+    (not paused, not absent) -- what "someone is listening" must mean for
+    the headphones and the open-the-player offer."""
+    return payload is not None and bool(payload.get("is_playing"))
 
 
 async def _music_sync_loop(
@@ -1256,6 +1373,13 @@ async def _music_sync_loop(
                 # been asked for it -- offer once per track instead of either
                 # silently ignoring it or showing up uninvited.
                 ambient = await service.current_payload()
+                # Spotify's currently-playing endpoint keeps returning the
+                # last track while it's *paused* (is_playing=false) -- that
+                # is not "someone is listening", and treating it as such put
+                # the headphones on (and offered the player) with nothing
+                # actually playing.
+                if not _is_actually_playing(ambient):
+                    ambient = None
                 offer_now = service.should_offer(ambient is not None)
                 # "Listening along": puts headphones on Bob's face while
                 # someone else's playback is going, independent of the
@@ -1452,6 +1576,42 @@ def create_app(
         bridge.agent.needs_engine.set_last_read_topic(lesson["topic"])
         bridge.agent.needs_engine.save()
         return {"topic": lesson["topic"], "trait": lesson["trait"]}
+
+    @application.get("/identity")
+    async def get_identity() -> dict[str, Any]:
+        """Bob's current persistent self-identity -- who he is, his
+        focus areas, and the self-notes he's accumulated so far (see
+        memory/identity.py). Read-only introspection, same purpose as
+        GET /idle/game_skill for the needs engine."""
+        state = bridge.agent.identity_store.state
+        return {
+            "who": state.who,
+            "focus_areas": state.focus_areas,
+            "self_notes": state.self_notes,
+            "knowledge": [entry.model_dump() for entry in state.knowledge],
+        }
+
+    @application.post("/identity/knowledge")
+    async def add_identity_knowledge(request: IdentityKnowledgeRequest) -> dict[str, Any]:
+        """Injects (or corrects, if the topic already exists) one piece of
+        guidance into Bob's brain -- the same thing "Bob, aprenda que..."
+        does by voice (see actions/robot/learning.py). Takes effect from
+        the next turn."""
+        store = bridge.agent.identity_store
+        store.add_knowledge(request.topic, request.text)
+        store.save()
+        return {"knowledge": [entry.model_dump() for entry in store.state.knowledge]}
+
+    @application.post("/identity/note")
+    async def add_identity_note(request: IdentityNoteRequest) -> dict[str, Any]:
+        """Appends one self-observation to Bob's identity -- this is what
+        actually makes the identity *grow* over time instead of staying a
+        fixed, hand-written block forever. It's injected into every
+        system prompt from the next turn on (see
+        memory/identity.py::as_prompt_fragment)."""
+        bridge.agent.identity_store.add_self_note(request.note)
+        bridge.agent.identity_store.save()
+        return {"self_notes": bridge.agent.identity_store.state.self_notes}
 
     @application.get("/idle/game_skill")
     async def game_skill() -> dict[str, Any]:
@@ -1663,6 +1823,16 @@ def create_app(
                         session.playback_done.set()
                 elif message.type == "device_status":
                     logger.debug("Status from %s: %s", device_id, message.payload)
+                elif message.type == "device_state":
+                    session = registry.get(device_id)
+                    if session is not None:
+                        for key in ("volume", "brightness"):
+                            value = message.payload.get(key)
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                session.device_state[key] = max(0, min(100, int(round(value))))
+                        shared = getattr(bridge.agent, "device_status", None)
+                        if shared is not None:
+                            shared.state = dict(session.device_state)
                 elif message.type == "idle_activity_report":
                     session = registry.get(device_id)
                     if session is not None:

@@ -202,3 +202,12 @@ def test_outgoing_message_keeps_versioned_envelope() -> None:
     assert message["version"] == 1
     assert message["device_id"] == "tablet_test"
     assert isinstance(message["timestamp"], int)
+
+
+def test_paused_or_missing_spotify_playback_is_not_listening() -> None:
+    from api.server import _is_actually_playing
+
+    assert _is_actually_playing(None) is False
+    assert _is_actually_playing({"track_id": "x", "is_playing": False}) is False
+    assert _is_actually_playing({"track_id": "x"}) is False
+    assert _is_actually_playing({"track_id": "x", "is_playing": True}) is True

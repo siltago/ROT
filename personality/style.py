@@ -37,6 +37,7 @@ def build_style_guide(
     hunger: float = 0.0,
     idle_seconds: float = 0.0,
     current_activity: str | None = None,
+    device_status: str | None = None,
 ) -> StyleGuide:
     # Tone driven mostly by emotional valence + irritation.
     if emotion.irritation > 0.6:
@@ -88,6 +89,12 @@ def build_style_guide(
             f'agora mesmo, antes dessa mensagem chegar, estava {current_activity} -- '
             'se perguntarem o que você está fazendo (ou o que está lendo/jogando), '
             'responda com isso, naturalmente, sem soar como uma lista de status'
+        )
+    if device_status:
+        notes.append(
+            f'estado atual do tablet onde você vive: {device_status} -- se '
+            'perguntarem, responda com isso; você pode ajustar volume e brilho '
+            'quando pedirem'
         )
 
     return StyleGuide(

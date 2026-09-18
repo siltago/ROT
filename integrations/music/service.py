@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
+from integrations.music.devices import SpotifyDevice
 from integrations.music.lyrics import LrclibProvider
 from integrations.music.models import PlaybackState, VisualCue
 from integrations.music.spotify import SpotifyProvider
@@ -30,6 +32,23 @@ class MusicExperienceService:
         self._ambient_playing = False
         self._last_offer_at: datetime | None = None
         self._re_offer_after = timedelta(hours=2)
+        # The device list changes rarely (someone opens/closes Spotify on
+        # a phone) but every fetch counts against Spotify's tight
+        # Development-Mode quota -- so it's only fetched when someone asks
+        # to play something, and reused for a short while.
+        self._devices: list[SpotifyDevice] = []
+        self._devices_at = 0.0
+        self._devices_ttl = 45.0
+
+    async def devices(self, *, force: bool = False) -> list[SpotifyDevice]:
+        """Devices available to play on, cached briefly. Raises whatever
+        the provider raises (e.g. a rate limit) -- callers that can carry
+        on without the list should catch it."""
+        if not force and self._devices and time.monotonic() - self._devices_at < self._devices_ttl:
+            return self._devices
+        self._devices = await self.spotify.devices()
+        self._devices_at = time.monotonic()
+        return self._devices
 
     def should_offer(self, is_playing: bool) -> bool:
         """Whether to prompt to open the player right now for playback
@@ -55,7 +74,7 @@ class MusicExperienceService:
         self._last_offer_at = now
         return True
 
-    async def play(self, query: str) -> PlaybackState | None:
+    async def play(self, query: str, device_id: str | None = None) -> PlaybackState | None:
         # Set *before* the (multi-step, network-bound) call below, not
         # after -- the sync loop's ambient-offer check runs concurrently
         # on its own poll tick, and with this flag only flipping once
@@ -67,7 +86,7 @@ class MusicExperienceService:
         # freshly started playback.
         self.presenting = True
         try:
-            track = await self.spotify.play(query)
+            track = await (self.spotify.play(query, device_id) if device_id else self.spotify.play(query))
         except Exception:
             self.presenting = False
             raise

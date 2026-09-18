@@ -16,6 +16,8 @@ from actions.music import player as music_actions
 from actions.permissions import PermissionPolicy, auto_deny
 from actions.registry import ActionRegistry
 from actions.robot import movement as robot_actions
+from actions.robot import device as device_actions
+from actions.robot import learning as learning_actions
 from actions.robot import play as play_actions
 from actions.smart_home import lights as light_actions
 from actions.smart_home import security as security_actions
@@ -28,6 +30,7 @@ from brain.agent import RobotAgent
 from brain.context import ContextBuilder
 from brain.decision_engine import DecisionEngine
 from brain.planner import Planner
+from brain.reflection import SelfReflector
 from brain.response_engine import ResponseEngine
 from emotions.engine import EmotionalEngine
 from emotions.needs import NeedsEngine, NeedsStore
@@ -41,6 +44,7 @@ from integrations.music.spotify import SpotifyProvider
 from integrations.smart_home.provider import SmartHomeProvider
 from integrations.smart_home.service import SmartHomeService
 from integrations.smart_home.home_assistant_provider import HomeAssistantProvider
+from memory.identity import IdentityStore
 from memory.long_term import LongTermMemory
 from memory.people import PeopleDirectory
 from memory.repository import InMemoryRepository, JsonFileRepository, Repository
@@ -98,6 +102,22 @@ def build_needs_repository() -> Repository:
     return InMemoryRepository()
 
 
+def build_identity_repository() -> Repository:
+    """Same shape as build_needs_repository() -- Supabase-backed when
+    configured, falling back to a non-persistent in-memory store so the
+    rest of the app still runs before that's set up (Bob's self-identity
+    just resets to the hardcoded default on every restart until it is)."""
+    if settings.supabase_url and settings.supabase_key:
+        from supabase import create_client
+
+        from memory.supabase_repository import SupabaseRepository
+
+        client = create_client(settings.supabase_url, settings.supabase_key)
+        return SupabaseRepository(client, table_name="robot_identity")
+    logger.warning("SUPABASE_URL/SUPABASE_KEY not set -- robot identity won't persist across restarts")
+    return InMemoryRepository()
+
+
 def build_llm_provider() -> LLMProvider | None:
     if not settings.llm_enabled:
         return None
@@ -118,15 +138,20 @@ def build_agent(
     hardware = hardware or SimulatorHardware(verbose=settings.verbose_hardware)
 
     registry = ActionRegistry()
+    # Built up front (not with the other stores below) because the music
+    # actions read its remembered preferences (e.g. default playback device).
+    identity_store = IdentityStore(build_identity_repository())
     security_actions.register(registry)
     music_service = MusicExperienceService(SpotifyProvider(
         settings.spotify_client_id, settings.spotify_client_secret,
         settings.spotify_refresh_token, timeout=settings.spotify_timeout,
     ))
-    music_actions.register(registry, music_service)
+    music_actions.register(registry, music_service, identity_store)
     alexa_actions.register(registry)
     robot_actions.register(registry, hardware)
     play_actions.register(registry)
+    device_status = device_actions.DeviceStatusSource()
+    device_actions.register(registry, device_status)
     weather_provider = OpenMeteoWeatherProvider(
         float(settings.robot_latitude) if settings.robot_latitude else None,
         float(settings.robot_longitude) if settings.robot_longitude else None,
@@ -158,6 +183,7 @@ def build_agent(
     personality = Personality.load(settings.personality_file)
     emotional_engine = EmotionalEngine(EmotionalStateStore.load(settings.emotional_state_file))
     needs_engine = NeedsEngine(NeedsStore(build_needs_repository()))
+    learning_actions.register(registry, identity_store, personality)
 
     llm_provider = build_llm_provider()
     response_engine = ResponseEngine(llm_provider=llm_provider)
@@ -183,6 +209,8 @@ def build_agent(
         personality=personality,
         emotional_engine=emotional_engine,
         needs_engine=needs_engine,
+        identity_store=identity_store,
+        reflector=SelfReflector(llm_provider, identity_store),
         people=people,
         long_term=long_term,
         short_term=short_term,
@@ -190,6 +218,7 @@ def build_agent(
         skill_teacher=skill_teacher,
     )
     agent.smart_home_service = smart_home_service
+    agent.device_status = device_status
     agent.music_service = music_service
     agent.skill_library = skill_library
     return agent

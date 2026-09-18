@@ -39,8 +39,10 @@ def _build_system_prompt(context: TurnContext) -> str:
     if context.relevant_memories:
         facts = "; ".join(m.text for m in context.relevant_memories)
         memory_line = f"O que você lembra sobre essa pessoa: {facts}. Use isso só quando for natural, sem forçar.\n"
+    identity_block = f"{context.identity_text}\n\n" if context.identity_text else ""
     return (
         f"{YBI_VOICE.prompt()}\n\n"
+        f"{identity_block}"
         "CONTEXTO DESTE TURNO\n"
         f"{person_line}\n"
         f"{memory_line}"
@@ -64,6 +66,17 @@ class ResponseEngine:
         if action_records:
             results = [_describe_outcome(r) for r in action_records]
             parts.append(" e ".join(results))
+
+        # An action that answered with a "which one?" question (see
+        # brain/choice.py) is waiting on the user -- nothing has happened
+        # yet, so the LLM must not add chatter like "colocando a música pra
+        # tocar" on top of the question.
+        asking = any(
+            r.outcome and not r.outcome.success and r.outcome.data.get("choice")
+            for r in action_records
+        )
+        if asking:
+            return " ".join(p for p in parts if p).strip()
 
         if decision.type in (IntentType.DIALOGUE, IntentType.DIALOGUE_AND_ACTION, IntentType.QUESTION):
             parts.append(await self._dialogue_reply(decision, context))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio, base64, json, random, re, time, urllib.error, urllib.parse, urllib.request
 from contextlib import suppress
+from integrations.music.devices import SpotifyDevice
 from integrations.music.models import PlaybackState
 
 
@@ -49,7 +50,27 @@ class SpotifyProvider:
             bool(data.get("is_playing")), int(time.time() * 1000),
             str(device.get("name") or ""))
 
-    async def play(self, query: str) -> PlaybackState | None:
+    async def devices(self) -> list[SpotifyDevice]:
+        """Every device currently logged into this Spotify account that
+        Spotify Connect can play on (a device appears as soon as its
+        Spotify app is running, even paused or in the background)."""
+        if not self.configured:
+            return []
+        data = await self._request("GET", "/v1/me/player/devices")
+        result = []
+        for raw in (data or {}).get("devices") or []:
+            if not raw.get("id") or raw.get("is_restricted"):
+                continue
+            result.append(SpotifyDevice(
+                id=str(raw["id"]),
+                name=str(raw.get("name") or ""),
+                type=str(raw.get("type") or ""),
+                is_active=bool(raw.get("is_active")),
+                volume_percent=raw.get("volume_percent"),
+            ))
+        return result
+
+    async def play(self, query: str, device_id: str | None = None) -> PlaybackState | None:
         cleaned = _QUERY_FILLER_PREFIX.sub("", query).strip() or query
         # limit=10 (not 1): the top match is what actually plays -- the
         # rest are only a pool for the queue below, so a request never
@@ -64,7 +85,7 @@ class SpotifyProvider:
         if not items:
             raise SpotifyError("Não encontrei essa música no Spotify.")
         track = items[0]
-        await self._start_playback({"uris": [track["uri"]]})
+        await self._start_playback({"uris": [track["uri"]]}, device_id)
         # Spotify removed its public recommendations/"radio" endpoint
         # entirely in late 2024 (for every app, not a permission gap) --
         # queueing a few more of this same search's other matches is the
@@ -94,7 +115,7 @@ class SpotifyProvider:
                 return
             raise
 
-    async def _start_playback(self, body: dict) -> None:
+    async def _start_playback(self, body: dict, device_id: str | None = None) -> None:
         """PUT /v1/me/player/play, retried against a specific device if
         Spotify says nothing is currently active. A device shows up in
         `/v1/me/player/devices` as soon as its Spotify app/client is
@@ -102,6 +123,12 @@ class SpotifyProvider:
         just won't pick one on its own without an explicit device_id, so
         this is what actually saves "toca X" from failing any time nothing
         happens to already be the active device."""
+        if device_id:
+            # An explicit target (the user chose where to listen): Spotify
+            # wakes/transfers to that device itself.
+            path = "/v1/me/player/play?" + urllib.parse.urlencode({"device_id": device_id})
+            await self._request("PUT", path, body)
+            return
         try:
             await self._request("PUT", "/v1/me/player/play", body)
         except SpotifyError as exc:

@@ -1,7 +1,7 @@
 name: robot_tablet_app
 description: Android-first tablet client for Robot Brain.
 publish_to: 'none'
-version: 0.1.0+32
+version: 0.1.0+33
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
